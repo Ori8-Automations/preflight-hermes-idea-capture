@@ -47,6 +47,8 @@ explicit, human action (and even then it only drafts a card for you to copy).
 - **Custom statuses** (with colors), **custom source types**, and
   **export/import** of the whole dataset as a single JSON file — all managed
   from the **Manage** view.
+- **Readable markdown tables** — GitHub-style pipe tables render as scrollable
+  tables in notes preview, with higher-contrast inline code pills for dark mode.
 - **Dark-mode first**, with a light fallback.
 
 No dummy data: Preflight starts with an empty category tree, a set of sensible

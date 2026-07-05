@@ -146,7 +146,10 @@ textarea.ic-input { resize: vertical; }
 .ic-md-p { margin: 4px 0; }
 .ic-md-ul { margin: 4px 0; padding-left: 20px; }
 .ic-md-empty { color: var(--ic-muted); }
-.ic-code { background: var(--ic-panel-2); border: 1px solid var(--ic-border); border-radius: 4px; padding: 0 4px; font-family: ui-monospace, monospace; font-size: 12px; }
+.ic-code {
+  background: #253041; border: 1px solid #3b4657; border-radius: 5px; padding: 0 5px;
+  color: #dbeafe; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+}
 .ic-link { color: var(--ic-accent); }
 
 .ic-detail-actions { display: flex; align-items: center; gap: 8px; }
@@ -249,3 +252,19 @@ textarea.ic-input { resize: vertical; }
 /* Manage: inline new-category input row + emoji field. */
 .ic-qa-new { gap: 8px; }
 .ic-emoji-input { width: 3rem; flex: 0 0 auto; text-align: center; }
+
+
+/* Markdown tables: render pipe tables as readable blocks instead of wall-of-pipes. */
+.ic-md-table-wrap {
+  max-width: 100%; overflow-x: auto; margin: 10px 0 12px;
+  border: 1px solid var(--ic-border); border-radius: 9px; background: var(--ic-bg);
+}
+.ic-md-table { width: 100%; border-collapse: collapse; min-width: 520px; }
+.ic-md-table th, .ic-md-table td {
+  padding: 8px 10px; border-right: 1px solid var(--ic-border); border-bottom: 1px solid var(--ic-border);
+  text-align: left; vertical-align: top; color: var(--ic-text); overflow-wrap: anywhere;
+}
+.ic-md-table th { background: var(--ic-panel-2); font-weight: 700; color: #f8fafc; }
+.ic-md-table tr:last-child td { border-bottom: 0; }
+.ic-md-table th:last-child, .ic-md-table td:last-child { border-right: 0; }
+.ic-md-table td p, .ic-md-table th p { margin: 0; }

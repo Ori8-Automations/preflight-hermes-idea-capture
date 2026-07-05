@@ -116,21 +116,76 @@
     return out;
   }
 
+  function isTableSeparator(line) {
+    var t = (line || "").trim();
+    if (t.charAt(0) === "|") t = t.slice(1);
+    if (t.charAt(t.length - 1) === "|") t = t.slice(0, -1);
+    var cells = t.split("|").map(function (c) { return c.trim(); });
+    return cells.length > 1 && cells.every(function (c) { return /^:?-{3,}:?$/.test(c); });
+  }
+
+  function isTableRow(line) {
+    return /^\s*\|.*\|\s*$/.test(line || "");
+  }
+
+  function splitTableRow(line) {
+    var t = (line || "").trim();
+    if (t.charAt(0) === "|") t = t.slice(1);
+    if (t.charAt(t.length - 1) === "|") t = t.slice(0, -1);
+    return t.split("|").map(function (c) { return c.trim(); });
+  }
+
+  function tableBlock(lines, start, keyPrefix) {
+    var header = splitTableRow(lines[start]);
+    var rows = [];
+    var i = start + 2;
+    while (i < lines.length && isTableRow(lines[i]) && !isTableSeparator(lines[i])) {
+      rows.push(splitTableRow(lines[i]));
+      i += 1;
+    }
+    return {
+      next: i,
+      node: h("div", { key: keyPrefix, className: "ic-md-table-wrap" },
+        h("table", { className: "ic-md-table" },
+          h("thead", null,
+            h("tr", null, header.map(function (cell, idx) {
+              return h("th", { key: "th" + idx }, inlineNodes(cell, keyPrefix + "-th" + idx + "-"));
+            }))
+          ),
+          h("tbody", null, rows.map(function (row, ri) {
+            return h("tr", { key: "tr" + ri }, header.map(function (_cell, ci) {
+              var cell = row[ci] || "";
+              return h("td", { key: "td" + ri + "-" + ci }, inlineNodes(cell, keyPrefix + "-td" + ri + "-" + ci + "-"));
+            }));
+          }))
+        )
+      )
+    };
+  }
+
   function renderMarkdown(md) {
     var lines = (md || "").replace(/\r\n/g, "\n").split("\n");
-    var blocks = [], list = null, k = 0;
+    var blocks = [], list = null, k = 0, i = 0;
     function flush() {
       if (list) { blocks.push(h("ul", { key: "ul" + k++, className: "ic-md-ul" }, list)); list = null; }
     }
-    lines.forEach(function (line, li) {
-      var t = line.replace(/\s+$/, "");
+    while (i < lines.length) {
+      var t = lines[i].replace(/\s+$/, "");
       var hm = /^(#{1,3})\s+(.*)$/.exec(t);
       var bm = /^[-*]\s+(.*)$/.exec(t);
-      if (hm) { flush(); blocks.push(h("h" + (hm[1].length + 2), { key: "h" + li, className: "ic-md-h" }, inlineNodes(hm[2], "h" + li + "-"))); }
-      else if (bm) { if (!list) list = []; list.push(h("li", { key: "li" + li }, inlineNodes(bm[1], "li" + li + "-"))); }
+      if (isTableRow(t) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+        flush();
+        var table = tableBlock(lines, i, "tbl" + i);
+        blocks.push(table.node);
+        i = table.next;
+        continue;
+      }
+      if (hm) { flush(); blocks.push(h("h" + (hm[1].length + 2), { key: "h" + i, className: "ic-md-h" }, inlineNodes(hm[2], "h" + i + "-"))); }
+      else if (bm) { if (!list) list = []; list.push(h("li", { key: "li" + i }, inlineNodes(bm[1], "li" + i + "-"))); }
       else if (t.trim() === "") { flush(); }
-      else { flush(); blocks.push(h("p", { key: "p" + li, className: "ic-md-p" }, inlineNodes(t, "p" + li + "-"))); }
-    });
+      else { flush(); blocks.push(h("p", { key: "p" + i, className: "ic-md-p" }, inlineNodes(t, "p" + i + "-"))); }
+      i += 1;
+    }
     flush();
     if (!blocks.length) return [h("p", { key: "empty", className: "ic-muted" }, "No notes yet.")];
     return blocks;
