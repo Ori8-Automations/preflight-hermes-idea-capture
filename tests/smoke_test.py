@@ -110,6 +110,14 @@ def main() -> int:
     d3 = c.post(B + f"/ideas/{iid}/promote-draft", json={"acceptance_criteria": ["ships behind a flag"]})
     ok("- [ ] ships behind a flag" in d3.json()["draft"]["markdown"], "promote-draft with custom criteria")
 
+    # --- static UX guardrails ---
+    css = (DASHBOARD / "dist" / "style.css").read_text(encoding="utf-8")
+    ok("@media (max-width: 720px)" in css, "mobile breakpoint present")
+    ok("flex-direction: column" in css and "overflow: visible" in css, "mobile workspace stacks vertically")
+    ok("overflow-x: auto" in css and "ic-sidebar" in css, "mobile category chips can scroll horizontally")
+    ok("width: 100vw" in css and "height: 100dvh" in css, "mobile detail pane is full-screen")
+    ok("-webkit-line-clamp: 4" in css, "mobile cards clamp long summaries")
+
     # --- safety: bad id + path traversal ---
     ok(c.get(B + "/ideas/idea_BAD").status_code == 400, "bad idea id rejected")
     ok(c.get(B + "/ideas/..%2f..%2fetc%2fpasswd").status_code in (400, 404), "encoded traversal rejected")

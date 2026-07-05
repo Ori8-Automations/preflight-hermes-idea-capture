@@ -943,7 +943,7 @@
         h("span", { className: "ic-logo" }, "🛫"),
         h("div", null,
           h("div", { className: "ic-h1" }, "Preflight"),
-          h("div", { className: "ic-h2" }, "Idea capture — park ideas before they become Kanban work")
+          h("div", { className: "ic-h2" }, "Idea capture → Kanban staging")
         )
       ),
       h("div", { className: "ic-header-actions" },
@@ -951,7 +951,7 @@
           h("button", { className: "ic-seg" + (view === "ideas" ? " ic-seg-on" : ""), onClick: function () { setView("ideas"); } }, "Ideas"),
           h("button", { className: "ic-seg" + (view === "manage" ? " ic-seg-on" : ""), onClick: function () { setView("manage"); } }, "Manage")
         ),
-        view === "ideas" ? h("button", { className: "ic-btn", onClick: function () { setCaptureOpen(!captureOpen); } }, captureOpen ? "Close capture" : "⚡ Quick capture") : null,
+        view === "ideas" ? h("button", { className: "ic-btn", onClick: function () { setCaptureOpen(!captureOpen); } }, captureOpen ? "Close capture" : "⚡ Capture") : null,
         view === "ideas" ? h("button", { className: "ic-btn ic-btn-primary", onClick: function () { setQuickOpen(!quickOpen); } }, quickOpen ? "Close" : "+ New idea") : null
       )
     );

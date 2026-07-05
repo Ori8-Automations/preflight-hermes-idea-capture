@@ -50,6 +50,7 @@ explicit, human action (and even then it only drafts a card for you to copy).
 - **Readable markdown tables** — GitHub-style pipe tables render as scrollable
   tables in notes preview, with higher-contrast inline code pills for dark mode.
 - **Dark-mode first**, with a light fallback.
+- **Mobile-friendly responsive layout** with stacked controls, horizontal category chips, full-width cards, and a full-screen detail editor on phone-sized screens.
 
 No dummy data: Preflight starts with an empty category tree, a set of sensible
 default statuses, a few generic starter templates, and a generic list of source
@@ -229,7 +230,7 @@ curl -X POST .../ideas/<id>/promote-draft -H 'Content-Type: application/json' \
 A self-contained smoke test exercises static checks plus the full API surface
 (health, config, category/subcategory/template/idea CRUD, source-type filter,
 updates, export/import round-trip, custom source-type restore into a fresh data
-root, source URL scheme safety, promote-draft with `{}` **and** with no body,
+root, source URL scheme safety, mobile stylesheet checks, promote-draft with `{}` **and** with no body,
 bad-id rejection, and path-traversal safety):
 
 ```bash
