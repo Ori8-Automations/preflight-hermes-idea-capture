@@ -118,6 +118,7 @@ def main() -> int:
     ok("width: 100vw" in css and "height: 100dvh" in css, "mobile detail pane is full-screen")
     ok("-webkit-line-clamp: 4" in css, "mobile cards clamp long summaries")
     ok("max-height: min(52vh, 560px)" in css and "overscroll-behavior: contain" in css, "long markdown preview scrolls internally")
+    ok("grid-template-columns: minmax(0, 1fr) auto" in css and "text-overflow: ellipsis" in css, "mobile detail title does not overlap actions")
 
     # --- safety: bad id + path traversal ---
     ok(c.get(B + "/ideas/idea_BAD").status_code == 400, "bad idea id rejected")
