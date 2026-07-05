@@ -1,0 +1,27 @@
+name: preflight-idea-capture
+version: "1.0.0"
+description: Lightweight Hermes Dashboard idea-capture staging area before ideas become Kanban execution items.
+license: MIT
+homepage: https://github.com/ori8automations/preflight-hermes-idea-capture
+
+# This is a dashboard-only plugin: the extension lives in dashboard/.
+entry_points:
+  dashboard: dashboard/manifest.json
+
+# Preflight ships no agent tools, makes no network calls, and only ever
+# reads/writes inside its own data root.
+permissions:
+  tools: false
+  network: false
+  filesystem:
+    - ${HERMES_HOME}/idea-capture
+    - ${PREFLIGHT_IDEA_CAPTURE_DIR}
+
+metadata:
+  hermes:
+    category: productivity
+    tags:
+      - dashboard
+      - idea-capture
+      - preflight
+      - kanban-staging
