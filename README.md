@@ -1,22 +1,18 @@
 # Preflight — Hermes Idea Capture
 
-Hermes Dashboard plugin for lightweight idea capture — categories, subcategories, notes, statuses, sources, and updates before work becomes Kanban.
+Preflight is a lightweight **idea-capture** dashboard plugin for the
+[Hermes Agent](https://hermes-agent.nousresearch.com). It gives operators a
+simple place to collect ideas, market signals, future projects, and rough notes
+before promoting them into executable agent work. It is intentionally **not** a
+full project-management system.
 
-> **Early / community package.** Preflight is functional and in active use, but the dashboard plugin API surface may change as Hermes evolves. Pin your version if you need stability.
-
-## Why this exists
-
-Hermes already has Kanban for active agent execution. That is exactly the problem: not every thought deserves to become executable work the moment it appears.
-
-**Ideas need a staging area.** Random product ideas, market signals, research links, and “maybe later” work should be easy to capture without cluttering an execution board. Preflight gives those rough signals a structured shelf:
-
-```text
-Category → Subcategory → Idea → notes · status · source · updates
+```
+Category  →  Subcategory  →  Idea  →  notes · status · source · updates
 ```
 
-**Agent workflows need a pre-execution layer.** Most project tools push you from idea straight to task. Preflight keeps the front of the pipeline intentionally quieter:
+It's the front of a simple pipeline:
 
-```text
+```
 signal / thought / maybe
   → structured idea
   → candidate work
@@ -24,13 +20,49 @@ signal / thought / maybe
   → agent execution
 ```
 
-Preflight owns the first two steps and stops there. “Draft Kanban card” creates copy-ready text only — it does not dispatch an agent, create a card, or call an external service.
+Preflight owns the first two steps and stops there — promoting to Kanban is an
+explicit, human action (and even then it only drafts a card for you to copy).
 
-**Full project management is out of scope.** No sprints, no assignments, no workload reports, no external trackers. This is a local, read/write idea shelf for operators who want Mission Control without buying a second cockpit.
+<!-- Add a screenshot here once you've deployed it, e.g.:
+![Preflight](docs/screenshot.png)
+-->
+
+## Features
+
+- **Dashboard tab** in the Hermes Dashboard.
+- **⚡ Quick capture** — a friction-free single-line bar that stays open so you
+  can dump several ideas in a row.
+- **Ideas** with title, category/subcategory, status, priority, source URL,
+  **source type**, tags, and markdown notes.
+- **Item templates** — start a new idea from a template that prefills status,
+  priority, source type, tags, and a notes scaffold.
+- **Sidebar tree** of categories → subcategories with live counts.
+- **Filter** by category/subcategory/status/source type, free-text search, and
+  sort. All filtering is client-side and instant.
+- **Detail pane** with a live markdown preview and an append-only update
+  timeline. Status changes are auto-logged.
+- **Draft a Kanban card** — generate a copy-ready card draft (title, summary,
+  source, acceptance-criteria checklist, and an idea back-reference). It's a
+  draft only; nothing is created or dispatched automatically.
+- **Custom statuses** (with colors) and **export/import** of the whole dataset
+  as a single JSON file — all managed from the **Manage** view.
+- **Dark-mode first**, with a light fallback.
+
+No dummy data: Preflight starts with an empty category tree, a set of sensible
+default statuses, a few generic starter templates, and a generic list of source
+types — all editable.
+
+## Requirements
+
+- A running Hermes Agent dashboard (FastAPI backend).
+- No build step and no npm dependencies — the frontend renders via the Hermes
+  Plugin SDK. No external Python dependencies beyond what Hermes already ships
+  (FastAPI + Pydantic).
 
 ## Install
 
-Copy the plugin directory into your Hermes plugins path, enable it, and restart the dashboard:
+Copy the `preflight-idea-capture/` directory into your Hermes plugins path,
+enable it, and (re)start the dashboard:
 
 ```bash
 cp -r preflight-idea-capture ~/.hermes/plugins/
@@ -38,7 +70,8 @@ hermes plugins enable preflight-idea-capture
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open
 ```
 
-Manual config fallback:
+**Manual config fallback** — if you manage plugins via config instead of the
+CLI, add the plugin to your Hermes `config.yaml`:
 
 ```yaml
 plugins:
@@ -46,80 +79,100 @@ plugins:
     - preflight-idea-capture
 ```
 
-Then restart the dashboard, or rescan if it is already running:
+then restart the dashboard (or, if it's already running, force a rescan):
 
 ```bash
 curl http://127.0.0.1:9119/api/dashboard/plugins/rescan
 ```
 
-The **Preflight** tab appears in the dashboard navigation.
+The **Preflight** tab appears in the dashboard nav.
 
-## Data setup
+## Layout
 
-Preflight stores JSON files under one data root:
+```
+preflight-idea-capture/
+├── plugin.yaml            # root plugin metadata (name, version, permissions)
+└── dashboard/
+    ├── manifest.json      # dashboard manifest (tab, entry, api)
+    ├── dist/
+    │   ├── index.js       # frontend (no build step; uses the Hermes Plugin SDK)
+    │   └── style.css      # scoped styles, dark-mode first
+    └── plugin_api.py      # FastAPI router — mounted at /api/plugins/preflight-idea-capture/
+```
 
-```text
+## Data & storage
+
+File-backed JSON, all under a single allow-listed data root:
+
+```
 <DATA_ROOT>/
-  categories.json
+  categories.json         # category tree + custom status + template definitions
   ideas/
-    idea_<id>.json
-  attachments/
+    idea_<id>.json        # one file per idea
+  attachments/            # reserved for future use
 ```
 
-Default root:
+Default `DATA_ROOT` is `$HERMES_HOME/idea-capture` (falling back to
+`~/.hermes/idea-capture`). Override it with the `PREFLIGHT_IDEA_CAPTURE_DIR`
+environment variable.
 
-```text
-$HERMES_HOME/idea-capture
+Back up or migrate everything with **Manage → Data → Export JSON**, and restore
+with **Import** (merge or replace).
+
+## Safety posture
+
+- **Constrained I/O:** the backend reads/writes **only** inside the data root.
+  Every path is resolved and verified to stay within that root, and
+  idea/category/status/template ids are strict slugs — so a crafted id cannot
+  escape the directory via path traversal.
+- **Safe import:** imported ideas are normalized and their ids validated (or
+  regenerated) before writing, so an import can never write outside the root.
+- **No Kanban creation:** "Draft Kanban card" only builds a draft you can copy.
+  It never creates a card or dispatches anything to any external system.
+- **No secrets/logs access, no external dependencies.**
+
+## Idea record shape
+
+```json
+{
+  "id": "idea_ab12cd34ef56",
+  "title": "Simple AI ticket summaries for MSPs",
+  "category": "product",
+  "subcategory": "signals",
+  "status": "parked",
+  "priority": "maybe",
+  "source_url": "https://…",
+  "source_type": "reddit",
+  "summary": "Short plain-English summary",
+  "notes_markdown": "…",
+  "tags": ["msp", "ai"],
+  "updates": [{ "at": "2026-01-01T00:00:00Z", "by": "me", "body": "…" }],
+  "created_at": "…",
+  "updated_at": "…",
+  "promoted_to_kanban": null
+}
 ```
 
-Override it when starting the dashboard:
-
-```bash
-PREFLIGHT_IDEA_CAPTURE_DIR=/path/to/idea-capture hermes dashboard --host 127.0.0.1 --port 9119 --no-open
-```
-
-Back up or migrate data with **Manage → Data → Export JSON**, then restore with **Import**.
-
-## Features
-
-| Area | What it does |
-|---|---|
-| Quick capture | Single-line capture bar for dumping ideas quickly |
-| Categories | Organize ideas by category and subcategory |
-| Statuses | Inbox, Parked, Researching, Candidate, Promoted, Discarded; editable |
-| Source tracking | Source URL and source type such as Reddit, web, internal, client, email |
-| Templates | Prefill status, priority, tags, source type, and note scaffolds |
-| Notes | Markdown notes with live preview |
-| Updates | Append-only update timeline; status changes are auto-logged |
-| Export/import | Move the whole dataset as JSON |
-| Kanban draft | Generate a copy-ready card draft, without creating anything automatically |
-
-## API
-
-Mounted by Hermes at:
-
-```text
-/api/plugins/preflight-idea-capture
-```
+## API (mounted at `/api/plugins/preflight-idea-capture`)
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Check data root and writability |
+| GET | `/health` | Data root + writability check |
 | GET | `/config` | Categories, statuses, templates, priorities, source types |
 | POST/PATCH/DELETE | `/categories[/{id}]` | Manage categories |
 | POST/PATCH/DELETE | `/categories/{id}/subcategories[/{sid}]` | Manage subcategories |
 | POST/PATCH/DELETE | `/statuses[/{id}]` | Manage custom statuses |
 | POST/PATCH/DELETE | `/templates[/{id}]` | Manage item templates |
-| GET | `/ideas` | List ideas; supports `category`, `subcategory`, `status`, `source_type`, `q`, `sort` |
-| GET/POST/PATCH/DELETE | `/ideas[/{id}]` | Read, create, edit, delete ideas |
-| POST | `/ideas/{id}/updates` | Append an update |
-| POST | `/ideas/{id}/promote-draft` | Generate a Kanban-card draft only |
-| GET | `/export` | Export config and ideas as JSON |
-| POST | `/import` | Import config and/or ideas with `merge` or `replace` mode |
+| GET | `/ideas` | List (supports `category`, `subcategory`, `status`, `source_type`, `q`, `sort`) |
+| GET/POST/PATCH/DELETE | `/ideas[/{id}]` | Read/create/edit/delete ideas |
+| POST | `/ideas/{id}/updates` | Append an update to the timeline |
+| POST | `/ideas/{id}/promote-draft` | Generate a Kanban card draft (draft only) |
+| GET | `/export` | Export the full dataset (config + all ideas) as JSON |
+| POST | `/import` | Import a dataset (`mode`: `merge` or `replace`) |
 
-## Export / import format
+### Export / import format
 
-`GET /export` returns top-level `config` and `ideas`:
+`GET /export` returns an object with **top-level** `config` and `ideas`:
 
 ```json
 {
@@ -130,7 +183,10 @@ Mounted by Hermes at:
 }
 ```
 
-`POST /import` expects the same top-level fields. There is no `bundle` wrapper:
+`POST /import` expects those same **top-level** fields (there is no `bundle`
+wrapper). `mode` is `merge` (add/overwrite by id, keep everything else) or
+`replace` (wipe existing ideas first). `config` and `ideas` are both optional —
+send whichever you want to import:
 
 ```json
 {
@@ -140,85 +196,57 @@ Mounted by Hermes at:
 }
 ```
 
-`mode` can be:
+So an export can be re-imported as-is (the extra `version`/`exported_at` keys are
+ignored). Imported ideas are normalized and their ids validated (or regenerated),
+so an import can never write outside the data root.
 
-| Mode | Behavior |
-|---|---|
-| `merge` | Add or overwrite by ID, keep everything else |
-| `replace` | Clear existing ideas first, then import supplied ideas |
+### Draft a Kanban card
 
-Imported ideas are normalized and their IDs are validated or regenerated before writing.
+`POST /ideas/{id}/promote-draft` builds a copy-ready card draft. The body is
+optional — all three of these work:
 
-## Safety posture
-
-Preflight is intentionally boring:
-
-- local file-backed JSON only
-- no external network calls
-- no Linear, Plane, GitHub, or ticketing integration
-- no automatic Kanban creation
-- no agent dispatch
-- no secret/log/ticket access
-- path traversal rejected by strict IDs and resolved-path checks
-- import normalizes records before writing
-
-The plugin is read/write inside its own data root only. Treat dashboard access itself as sensitive: if your dashboard is bound beyond loopback, protect it with the appropriate Hermes dashboard auth/Tailnet boundary.
-
-## Known limitations
-
-- File-backed JSON is designed for small/operator-scale idea shelves, not multi-user enterprise throughput.
-- There is no conflict resolution beyond simple last-write file replacement.
-- Attachments are reserved in the layout but not implemented yet.
-- “Draft Kanban card” returns text only; it does not create a Hermes Kanban card.
-- Dashboard plugin loading behavior can vary across Hermes versions; pin a working Hermes version for production use.
+```bash
+# no body
+curl -X POST .../ideas/<id>/promote-draft
+# empty JSON
+curl -X POST .../ideas/<id>/promote-draft -H 'Content-Type: application/json' -d '{}'
+# with custom acceptance criteria
+curl -X POST .../ideas/<id>/promote-draft -H 'Content-Type: application/json' \
+  -d '{"acceptance_criteria": ["ships behind a flag", "has a test"]}'
+```
 
 ## Tests
 
-Run the smoke test suite:
+A self-contained smoke test exercises static checks plus the full API surface
+(health, config, category/subcategory/template/idea CRUD, source-type filter,
+updates, export/import round-trip, promote-draft with `{}` **and** with no body,
+bad-id rejection, and path-traversal safety):
 
 ```bash
 ./tests/run_tests.sh
 ```
 
-If your system Python does not have Hermes/FastAPI dependencies, point the runner at your Hermes venv:
+It runs `py_compile`, `node --check`, and a FastAPI `TestClient` suite against a
+temporary `PREFLIGHT_IDEA_CAPTURE_DIR`.
+
+The runner auto-selects a Python that has the test deps: it prefers `$PYTHON`,
+then an active `$VIRTUAL_ENV`, then `/opt/hermes/.venv/bin/python`, then
+`python3`. The system `python3` usually lacks `fastapi`, so if you installed
+the dashboard in a venv just let it pick that up, or point at it explicitly:
 
 ```bash
-PYTHON=/path/to/hermes/.venv/bin/python ./tests/run_tests.sh
+PYTHON=/opt/hermes/.venv/bin/python ./tests/run_tests.sh
 ```
 
-The suite covers:
+(Needs `fastapi` + `httpx` in the chosen interpreter.)
 
-- Python compile
-- JavaScript syntax when `node` is available
-- health/config endpoints
-- category/subcategory/template/idea CRUD
-- source-type filtering
-- update append
-- export/import round trip
-- promote-draft with `{}`, omitted body, and custom criteria
-- bad ID rejection
-- encoded traversal rejection
-- malformed imported IDs regenerated safely
-- no escaped files
+## Contributing
 
-## Repository layout
+Issues and PRs welcome. The frontend is a single dependency-free IIFE
+(`dashboard/dist/index.js`) that renders with the SDK's React instance — no
+build step, edit and reload. The backend is a single FastAPI router
+(`dashboard/plugin_api.py`).
 
-```text
-preflight-idea-capture/
-  plugin.yaml
-  dashboard/
-    manifest.json
-    plugin_api.py
-    dist/
-      index.js
-      style.css
-tests/
-  run_tests.sh
-  smoke_test.py
-README.md
-LICENSE
-```
+## License
 
-## Credits
-
-Built by [Claude](https://claude.ai) (Anthropic) under the direction of **Ori8**, the Hermes-based AI agent at the core of [Ori8 Automations](https://github.com/ori8automations). A human provided requirements, review, live testing, and final approval.
+Released under the MIT License. See [LICENSE](LICENSE).
