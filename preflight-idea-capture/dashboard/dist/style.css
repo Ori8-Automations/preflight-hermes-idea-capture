@@ -214,3 +214,38 @@ textarea.ic-input { resize: vertical; }
   .ic-detail { position: fixed; right: 0; top: 0; bottom: 0; width: min(420px, 92vw); z-index: 30; box-shadow: -8px 0 24px rgba(0,0,0,.4); }
   .ic-sidebar { width: 180px; }
 }
+
+/* ---- 2026-07 UX pass: contrast, wider/expandable detail, readable notes ---- */
+
+/* Higher-contrast muted text on dark (was too dim). */
+.ic-root { --ic-muted: #aeb8c6; }
+.ic-card-summary, .ic-update-text, .ic-md-p, .ic-md-ul li { color: var(--ic-text); }
+
+/* Wider detail pane by default; expandable to fill the workspace. */
+.ic-detail { width: min(560px, 46vw); }
+.ic-detail-head-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.ic-copied { font-size: 11px; color: var(--ic-accent); white-space: nowrap; margin-right: 4px; }
+
+.ic-workspace-expanded { display: block; }
+.ic-workspace-expanded .ic-detail {
+  width: auto; flex: 1 1 auto; border-left: 0; max-width: none; height: 100%;
+}
+/* In expanded mode give the notes editor + preview room and readable measure. */
+.ic-workspace-expanded .ic-notes-edit { min-height: 220px; }
+.ic-workspace-expanded .ic-notes-preview { max-width: 78ch; }
+.ic-workspace-expanded .ic-detail-controls { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+/* Notes: bigger editor + more readable preview typography. */
+.ic-notes-edit { min-height: 130px; line-height: 1.55; }
+.ic-notes-preview {
+  line-height: 1.7; font-size: 13.5px; max-width: 72ch;
+  padding: 14px 16px; overflow-wrap: anywhere;
+}
+.ic-notes-preview .ic-md-h { margin: 14px 0 6px; line-height: 1.3; }
+.ic-notes-preview .ic-md-p { margin: 8px 0; }
+.ic-notes-preview .ic-md-ul { margin: 8px 0; padding-left: 22px; }
+.ic-notes-preview .ic-md-ul li { margin: 3px 0; }
+
+/* Manage: inline new-category input row + emoji field. */
+.ic-qa-new { gap: 8px; }
+.ic-emoji-input { width: 3rem; flex: 0 0 auto; text-align: center; }

@@ -66,12 +66,11 @@
 
   function timeAgo(iso) {
     if (!iso) return "";
-    if (SDK.utils && SDK.utils.timeAgo) {
-      try { return SDK.utils.timeAgo(iso); } catch (e) { /* fall through */ }
-    }
+    // Parse ourselves (the host SDK's timeAgo mis-parses our ISO stamps → "NaNd ago").
     var then = new Date(iso).getTime();
     if (isNaN(then)) return "";
     var s = Math.floor((Date.now() - then) / 1000);
+    if (s < 0) s = 0;
     if (s < 60) return "just now";
     var m = Math.floor(s / 60); if (m < 60) return m + "m ago";
     var hr = Math.floor(m / 60); if (hr < 24) return hr + "h ago";
@@ -80,8 +79,21 @@
     return Math.floor(mo / 12) + "y ago";
   }
 
+  function cleanUrl(url) {
+    var raw = (url || "").trim();
+    if (!raw) return "";
+    try {
+      var u = new URL(raw);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+      return raw;
+    } catch (e) {
+      return "";
+    }
+  }
+
   function hostOf(url) {
-    try { return new URL(url).hostname.replace(/^www\./, ""); } catch (e) { return url; }
+    var safe = cleanUrl(url);
+    try { return new URL(safe).hostname.replace(/^www\./, ""); } catch (e) { return safe; }
   }
 
   // ---- Safe, dependency-free markdown-lite renderer --------------------- //
@@ -149,6 +161,13 @@
     return id || "";
   }
 
+  function sourceEmoji(sourceTypes, id) {
+    for (var i = 0; i < (sourceTypes || []).length; i++) {
+      if (sourceTypes[i].id === id && sourceTypes[i].emoji) return sourceTypes[i].emoji;
+    }
+    return SOURCE_EMOJI[id] || "";
+  }
+
   // ----------------------------------------------------------------------- //
   // Generic modal
   // ----------------------------------------------------------------------- //
@@ -176,7 +195,7 @@
 
   function IdeaCard(props) {
     var idea = props.idea;
-    var src = idea.source_url;
+    var src = cleanUrl(idea.source_url);
     var prio = PRIORITY_META[idea.priority || ""] || PRIORITY_META[""];
     return h("div", {
       className: "ic-card" + (props.active ? " ic-card-active" : ""),
@@ -190,7 +209,7 @@
       h("div", { className: "ic-card-meta" },
         h("span", { className: "ic-chip" }, catName(props.categories, idea.category)),
         idea.subcategory ? h("span", { className: "ic-chip ic-chip-sub" }, subName(props.categories, idea.category, idea.subcategory)) : null,
-        idea.source_type ? h("span", { className: "ic-chip ic-chip-src" }, (SOURCE_EMOJI[idea.source_type] || "") + " " + sourceLabel(props.sourceTypes, idea.source_type)) : null,
+        idea.source_type ? h("span", { className: "ic-chip ic-chip-src" }, (sourceEmoji(props.sourceTypes, idea.source_type) + " " + sourceLabel(props.sourceTypes, idea.source_type)).trim()) : null,
         idea.priority ? h("span", { className: "ic-prio", style: { color: prio.color } }, "● " + prio.label) : null,
         (idea.tags || []).map(function (t, i) { return h("span", { key: i, className: "ic-tag" }, "#" + t); }),
         h("span", { className: "ic-spacer" }),
@@ -253,11 +272,29 @@
     var form = s[0], setForm = s[1];
     var busy = useState(false); var isBusy = busy[0], setBusy = busy[1];
     var tpl = useState(""); var tplId = tpl[0], setTplId = tpl[1];
+    var ncS = useState(""); var newCat = ncS[0], setNewCat = ncS[1];
+    var nsS = useState(""); var newSub = nsS[0], setNewSub = nsS[1];
 
     function set(k, v) {
       var next = {}; next[k] = v;
       if (k === "category") next.subcategory = "";
       setForm(Object.assign({}, form, next));
+    }
+    function createCategory() {
+      var name = newCat.trim();
+      if (!name || !props.onAddCategory) return;
+      props.onAddCategory(name).then(function (c) {
+        if (c && c.id) setForm(Object.assign({}, form, { category: c.id, subcategory: "" }));
+        setNewCat("");
+      });
+    }
+    function createSubcategory() {
+      var name = newSub.trim();
+      if (!name || !props.onAddSubcategory || !form.category || form.category === "__new__") return;
+      props.onAddSubcategory(form.category, name).then(function (sub) {
+        if (sub && sub.id) setForm(Object.assign({}, form, { subcategory: sub.id }));
+        setNewSub("");
+      });
     }
     function applyTemplate(id) {
       setTplId(id);
@@ -304,11 +341,13 @@
       h("div", { className: "ic-qa-row" },
         h("select", { className: "ic-input", value: form.category, onChange: function (e) { set("category", e.target.value); } },
           h("option", { value: "" }, "Category…"),
-          categories.map(function (c) { return h("option", { key: c.id, value: c.id }, c.name); })
+          categories.map(function (c) { return h("option", { key: c.id, value: c.id }, c.name); }),
+          props.onAddCategory ? h("option", { value: "__new__" }, "➕ New category…") : null
         ),
-        h("select", { className: "ic-input", value: form.subcategory, disabled: !subs.length, onChange: function (e) { set("subcategory", e.target.value); } },
+        h("select", { className: "ic-input", value: form.subcategory, disabled: form.category === "__new__" || !form.category || (!subs.length && !props.onAddSubcategory), onChange: function (e) { set("subcategory", e.target.value); } },
           h("option", { value: "" }, subs.length ? "Subcategory…" : "—"),
-          subs.map(function (sc) { return h("option", { key: sc.id, value: sc.id }, sc.name); })
+          subs.map(function (sc) { return h("option", { key: sc.id, value: sc.id }, sc.name); }),
+          (props.onAddSubcategory && form.category && form.category !== "__new__") ? h("option", { value: "__new__" }, "➕ New subcategory…") : null
         ),
         h("select", { className: "ic-input", value: form.status, onChange: function (e) { set("status", e.target.value); } },
           statuses.map(function (st) { return h("option", { key: st.id, value: st.id }, st.label); })
@@ -317,6 +356,18 @@
           Object.keys(PRIORITY_META).map(function (p) { return h("option", { key: p || "none", value: p }, "Priority: " + PRIORITY_META[p].label); })
         )
       ),
+      form.category === "__new__" ? h("div", { className: "ic-qa-row ic-qa-new" },
+        h("input", { className: "ic-input", placeholder: "New category name", value: newCat, autoFocus: true,
+          onChange: function (e) { setNewCat(e.target.value); },
+          onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); createCategory(); } } }),
+        h("button", { type: "button", className: "ic-btn ic-btn-primary", disabled: !newCat.trim(), onClick: createCategory }, "Create category")
+      ) : null,
+      form.subcategory === "__new__" ? h("div", { className: "ic-qa-row ic-qa-new" },
+        h("input", { className: "ic-input", placeholder: "New subcategory name", value: newSub, autoFocus: true,
+          onChange: function (e) { setNewSub(e.target.value); },
+          onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); createSubcategory(); } } }),
+        h("button", { type: "button", className: "ic-btn ic-btn-primary", disabled: !newSub.trim(), onClick: createSubcategory }, "Create subcategory")
+      ) : null,
       h("div", { className: "ic-qa-row" },
         h("select", { className: "ic-input", value: form.source_type, onChange: function (e) { set("source_type", e.target.value); } },
           sourceTypes.map(function (st) { return h("option", { key: st.id || "none", value: st.id }, st.id ? "Source: " + st.label : "Source type…"); })
@@ -376,6 +427,7 @@
     var ed = useState(null); var draft = ed[0], setDraft = ed[1];
     var up = useState(""); var upBody = up[0], setUpBody = up[1];
     var au = useState("me"); var author = au[0], setAuthor = au[1];
+    var cp = useState(""); var copied = cp[0], setCopied = cp[1];
 
     useEffect(function () {
       setDraft({
@@ -386,6 +438,7 @@
         tags: (idea.tags || []).join(", "),
       });
       setUpBody("");
+      setCopied("");
     }, [idea.id]);
 
     if (!draft) return null;
@@ -410,13 +463,45 @@
       if (!upBody.trim()) return;
       props.onAddUpdate(idea.id, upBody, author).then(function () { setUpBody(""); });
     }
+    function ideaLink() {
+      var loc = window.location;
+      return loc.origin + loc.pathname + loc.search + "#idea=" + encodeURIComponent(idea.id);
+    }
+    function copyText(text, label) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text);
+      } catch (e) { /* clipboard may be unavailable */ }
+      setCopied(label);
+    }
+    function copyLink() { copyText(ideaLink(), "link"); }
+    function copyMarkdown() {
+      var lines = ["# " + (idea.title || "(untitled)"), ""];
+      if (idea.summary) lines.push(idea.summary, "");
+      var meta = [];
+      if (idea.status) meta.push("Status: " + idea.status);
+      if (idea.priority) meta.push("Priority: " + idea.priority);
+      if (idea.source_type) meta.push("Source: " + sourceLabel(props.sourceTypes, idea.source_type));
+      if (meta.length) lines.push(meta.join(" · "), "");
+      var safeSourceUrl = cleanUrl(idea.source_url);
+      if (safeSourceUrl) lines.push("Link: " + safeSourceUrl, "");
+      if ((idea.tags || []).length) lines.push("Tags: " + idea.tags.map(function (t) { return "#" + t; }).join(" "), "");
+      if (idea.notes_markdown) lines.push(idea.notes_markdown, "");
+      lines.push("— " + ideaLink());
+      copyText(lines.join("\n"), "markdown");
+    }
 
     var updates = (idea.updates || []).slice().reverse();
 
     return h("section", { className: "ic-detail" },
       h("div", { className: "ic-detail-head" },
         h("input", { className: "ic-title-input", value: draft.title, onChange: function (e) { setD("title", e.target.value); } }),
-        h("button", { className: "ic-icon-btn", title: "Close", onClick: props.onClose }, "✕")
+        h("div", { className: "ic-detail-head-actions" },
+          copied ? h("span", { className: "ic-copied" }, "Copied " + copied + " ✓") : null,
+          h("button", { className: "ic-icon-btn", title: "Copy share link", onClick: copyLink }, "🔗"),
+          h("button", { className: "ic-icon-btn", title: "Copy as Markdown (for Telegram/agents)", onClick: copyMarkdown }, "⧉"),
+          props.onToggleExpand ? h("button", { className: "ic-icon-btn", title: props.expanded ? "Collapse" : "Expand", onClick: props.onToggleExpand }, props.expanded ? "⤡" : "⤢") : null,
+          h("button", { className: "ic-icon-btn", title: "Close", onClick: props.onClose }, "✕")
+        )
       ),
 
       h("div", { className: "ic-detail-controls" },
@@ -508,6 +593,7 @@
     var nt = useState({ name: "", source_type: "", status: "", priority: "", tags: "", notes_markdown: "" });
     var newTpl = nt[0], setNewTpl = nt[1];
     var im = useState({ mode: "merge", busy: false, msg: "" }); var imp = im[0], setImp = im[1];
+    var nsrc = useState({ label: "", emoji: "" }); var newSource = nsrc[0], setNewSource = nsrc[1];
 
     function subVal(id) { return subDraft[id] || ""; }
     function setSubVal(id, v) { var n = Object.assign({}, subDraft); n[id] = v; setSubDraft(n); }
@@ -560,12 +646,30 @@
       ),
 
       h("div", { className: "ic-manage-col" },
+        h("h3", { className: "ic-manage-h" }, "Sources"),
+        h("div", { className: "ic-row-add" },
+          h("input", { className: "ic-input ic-emoji-input", placeholder: "🔗", value: newSource.emoji, onChange: function (e) { setNewSource(Object.assign({}, newSource, { emoji: e.target.value })); } }),
+          h("input", { className: "ic-input", placeholder: "New source label", value: newSource.label, onChange: function (e) { setNewSource(Object.assign({}, newSource, { label: e.target.value })); } }),
+          h("button", { className: "ic-btn ic-btn-primary", disabled: !newSource.label.trim(), onClick: function () { A.addSource(newSource).then(function () { setNewSource({ label: "", emoji: "" }); }); } }, "Add")
+        ),
+        (config.source_types || []).filter(function (s) { return s.id; }).map(function (s) {
+          return h("div", { key: s.id, className: "ic-status-row" },
+            h("input", { className: "ic-input ic-emoji-input", defaultValue: s.emoji || "", title: "Emoji", onBlur: function (e) { if (e.target.value !== (s.emoji || "")) A.editSource(s.id, { emoji: e.target.value }); } }),
+            h("input", { className: "ic-input ic-inline-edit", defaultValue: s.label, onBlur: function (e) { if (e.target.value.trim() && e.target.value !== s.label) A.editSource(s.id, { label: e.target.value }); } }),
+            h("span", { className: "ic-chip ic-chip-src" }, ((s.emoji || "") + " " + s.label).trim()),
+            h("button", { className: "ic-icon-btn ic-danger", title: "Delete source type", onClick: function () { A.deleteSource(s.id); } }, "✕")
+          );
+        }),
+        h("p", { className: "ic-muted ic-small" }, "Deleting a source type leaves existing ideas' values unchanged.")
+      ),
+
+      h("div", { className: "ic-manage-col" },
         h("h3", { className: "ic-manage-h" }, "Templates"),
         h("p", { className: "ic-muted ic-small" }, "Prefill the new-idea form (status, priority, source type, tags, notes)."),
         (config.templates || []).map(function (t) {
           return h("div", { key: t.id, className: "ic-tpl-row" },
             h("span", { className: "ic-tpl-name" }, t.name),
-            t.source_type ? h("span", { className: "ic-chip ic-chip-src" }, (SOURCE_EMOJI[t.source_type] || "") + " " + sourceLabel(sourceTypes, t.source_type)) : null,
+            t.source_type ? h("span", { className: "ic-chip ic-chip-src" }, (sourceEmoji(sourceTypes, t.source_type) + " " + sourceLabel(sourceTypes, t.source_type)).trim()) : null,
             t.status ? h("span", { className: "ic-chip" }, t.status) : null,
             h("span", { className: "ic-spacer" }),
             h("button", { className: "ic-icon-btn ic-danger", title: "Delete template", onClick: function () { A.deleteTemplate(t.id); } }, "✕")
@@ -647,6 +751,7 @@
     var qa = useState(false); var quickOpen = qa[0], setQuickOpen = qa[1];
     var qc = useState(false); var captureOpen = qc[0], setCaptureOpen = qc[1];
     var dm = useState(null); var draft = dm[0], setDraft = dm[1];
+    var ex = useState(false); var expanded = ex[0], setExpanded = ex[1];
 
     var loadConfig = useCallback(function () {
       return req("GET", "/config").then(setConfig);
@@ -667,6 +772,21 @@
       req("GET", "/ideas/" + selectedId).then(function (d) { if (live) setDetail(d); }).catch(function () { if (live) setDetail(null); });
       return function () { live = false; };
     }, [selectedId]);
+
+    // Deep link: open #idea=<id> on load and when the hash changes, so a link
+    // can be shared (e.g. with an agent in Telegram) and lands on that idea.
+    useEffect(function () {
+      function openFromHash() {
+        var m = /[#&]idea=([^&]+)/.exec(window.location.hash || "");
+        if (m) {
+          try { setSelectedId(decodeURIComponent(m[1])); } catch (e) { setSelectedId(m[1]); }
+          setView("ideas");
+        }
+      }
+      openFromHash();
+      window.addEventListener("hashchange", openFromHash);
+      return function () { window.removeEventListener("hashchange", openFromHash); };
+    }, []);
 
     // Derived, fully client-side filtered + sorted list.
     var visible = useMemo(function () {
@@ -755,6 +875,9 @@
       deleteStatus: function (id) { return afterCfg(req("DELETE", "/statuses/" + id)); },
       addTemplate: function (t) { return afterCfg(req("POST", "/templates", t)); },
       deleteTemplate: function (id) { return afterCfg(req("DELETE", "/templates/" + id)); },
+      addSource: function (s) { return afterCfg(req("POST", "/source-types", s)); },
+      editSource: function (id, patch) { return afterCfg(req("PATCH", "/source-types/" + id, patch)); },
+      deleteSource: function (id) { return afterCfg(req("DELETE", "/source-types/" + id)); },
       exportData: exportData,
       importData: importData,
     };
@@ -805,9 +928,10 @@
         ? visible.map(function (i) { return h(IdeaCard, { key: i.id, idea: i, statuses: config.statuses, categories: config.categories, sourceTypes: config.source_types, active: i.id === selectedId, onClick: function () { setSelectedId(i.id === selectedId ? null : i.id); } }); })
         : [h("div", { key: "e", className: "ic-empty" }, ideas.length ? "No ideas match these filters." : "No ideas yet — use “⚡ Quick capture” or “+ New idea”.")];
 
-      body = h("div", { className: "ic-workspace" },
-        h(Sidebar, { categories: config.categories, ideas: ideas, filter: filter, onPick: function (c, s) { setFilter(Object.assign({}, filter, { category: c, subcategory: s })); } }),
-        h("div", { className: "ic-main" },
+      var showExpanded = detail && expanded;
+      body = h("div", { className: "ic-workspace" + (showExpanded ? " ic-workspace-expanded" : "") },
+        showExpanded ? null : h(Sidebar, { categories: config.categories, ideas: ideas, filter: filter, onPick: function (c, s) { setFilter(Object.assign({}, filter, { category: c, subcategory: s })); } }),
+        showExpanded ? null : h("div", { className: "ic-main" },
           captureOpen ? h(QuickCapture, {
             sourceTypes: config.source_types,
             defaultCategory: filter.category, defaultSubcategory: filter.subcategory,
@@ -819,12 +943,15 @@
             sourceTypes: config.source_types, templates: config.templates,
             defaultCategory: filter.category, defaultSubcategory: filter.subcategory,
             onCreate: createIdea, onCancel: function () { setQuickOpen(false); },
+            onAddCategory: actions.addCategory, onAddSubcategory: actions.addSub,
           }) : null,
           h("div", { className: "ic-list" }, list)
         ),
         detail ? h(DetailPane, {
           idea: detail, categories: config.categories, statuses: config.statuses, sourceTypes: config.source_types,
-          onPatch: patchIdea, onDelete: deleteIdea, onAddUpdate: addUpdate, onPromote: promoteDraft, onClose: function () { setSelectedId(null); },
+          expanded: expanded, onToggleExpand: function () { setExpanded(!expanded); },
+          onPatch: patchIdea, onDelete: deleteIdea, onAddUpdate: addUpdate, onPromote: promoteDraft,
+          onClose: function () { setSelectedId(null); setExpanded(false); },
         }) : null
       );
     }

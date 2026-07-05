@@ -61,15 +61,32 @@ def main() -> int:
     tpl = c.post(B + "/templates", json={"name": "Bug", "status": "inbox", "tags": ["bug"]}).json()
     ok(tpl["id"] == "bug", "create template")
 
+    # source types: config-backed CRUD
+    ok(c.get(B + "/config").json()["source_types"][0]["id"] == "", "source types lead with unset option")
+    src = c.post(B + "/source-types", json={"label": "Discord", "emoji": "🎮"}).json()
+    ok(src["id"] == "discord", "create source type")
+    ok(c.patch(B + "/source-types/" + src["id"], json={"emoji": "👾"}).json()["emoji"] == "👾", "edit source type")
+    tmp_src = c.post(B + "/source-types", json={"label": "Temporary", "emoji": "🧪"}).json()
+    ok(c.delete(B + "/source-types/" + tmp_src["id"]).status_code == 200, "delete source type")
+
     # --- ideas ---
     idea = c.post(B + "/ideas", json={
         "title": "AI ticket summaries",
         "category": cat["id"], "subcategory": sub["id"],
-        "source_type": "reddit", "tags": ["msp"],
+        "source_type": src["id"], "source_url": "https://example.com/signal", "tags": ["msp"],
     }).json()
     iid = idea["id"]
-    ok(iid.startswith("idea_") and idea["source_type"] == "reddit", "create idea")
-    ok(c.get(B + "/ideas?source_type=reddit").json()["count"] == 1, "filter by source_type")
+    ok(iid.startswith("idea_") and idea["source_type"] == src["id"], "create idea")
+    ok(idea["source_url"] == "https://example.com/signal", "https source_url preserved on create")
+    ok(c.get(B + "/ideas?source_type=" + src["id"]).json()["count"] == 1, "filter by source_type")
+
+    unsafe = c.post(B + "/ideas", json={"title": "Unsafe URL", "source_url": "javascript:alert(1)"}).json()
+    ok(unsafe["source_url"] == "", "unsafe source_url blanked on create")
+    safe_update = c.patch(B + f"/ideas/{unsafe['id']}", json={"source_url": "https://example.com/safe"}).json()
+    ok(safe_update["source_url"] == "https://example.com/safe", "https source_url preserved on update")
+    unsafe_update = c.patch(B + f"/ideas/{unsafe['id']}", json={"source_url": "data:text/html,<svg>"}).json()
+    ok(unsafe_update["source_url"] == "", "unsafe source_url blanked on update")
+    c.delete(B + f"/ideas/{unsafe['id']}")
 
     upd = c.post(B + f"/ideas/{iid}/updates", json={"body": "looked into it"}).json()
     ok(upd["updates"][-1]["by"] == "me", "append update (default author 'me')")
@@ -77,11 +94,13 @@ def main() -> int:
     # --- export / import round-trip ---
     exp = c.get(B + "/export").json()
     ok("config" in exp and "ideas" in exp and len(exp["ideas"]) == 1, "export bundle (top-level config/ideas)")
+    ok(any(s["id"] == src["id"] for s in exp["config"].get("source_types", [])), "export includes custom source types")
     ok(c.post(B + "/import", json={"mode": "replace", "ideas": []}).status_code == 200, "import replace clears")
     ok(c.get(B + "/ideas").json()["count"] == 0, "ideas cleared")
     imp = c.post(B + "/import", json={"mode": "merge", "config": exp["config"], "ideas": exp["ideas"]}).json()
     ok(imp["ideas_written"] == 1, "import merge writes ideas")
     ok(c.get(B + f"/ideas?q=summaries").json()["count"] == 1, "imported idea is searchable")
+    ok(c.get(B + "/ideas?source_type=" + src["id"]).json()["count"] == 1, "imported idea keeps custom source type")
 
     # --- promote-draft: empty JSON body AND omitted body ---
     d1 = c.post(B + f"/ideas/{iid}/promote-draft", json={})
@@ -99,6 +118,30 @@ def main() -> int:
     files = [str(p) for p in pathlib.Path(root).rglob("*") if p.is_file()]
     ok(all(f.startswith(root) for f in files), "no escaped files")
     ok(not any("evil" in f for f in files), "no file named from traversal id")
+
+    imported_bad_url = c.post(B + "/import", json={
+        "mode": "merge",
+        "ideas": [{"id": "idea_badurl1", "title": "Unsafe import URL", "source_url": "javascript:alert(1)"}],
+    }).json()
+    ok(imported_bad_url["ideas_written"] == 1, "unsafe-url idea imported")
+    clean_import = c.get(B + "/ideas/idea_badurl1").json()
+    ok(clean_import["source_url"] == "", "unsafe source_url blanked on import")
+    draft_bad_url = c.post(B + "/ideas/idea_badurl1/promote-draft", json={}).json()["draft"]
+    ok(draft_bad_url["source_url"] == "" and "javascript:" not in draft_bad_url["markdown"], "promote-draft excludes unsafe source_url")
+
+    # Import into a fresh data root: custom source types must be restored before
+    # ideas are normalized, otherwise ideas keep only raw ids without labels.
+    root2 = tempfile.mkdtemp(prefix="preflight-smoke-restore-")
+    os.environ["PREFLIGHT_IDEA_CAPTURE_DIR"] = root2
+    plugin_api = importlib.reload(plugin_api)
+    app2 = FastAPI()
+    app2.include_router(plugin_api.router, prefix="/api/plugins/preflight-idea-capture")
+    c2 = TestClient(app2)
+    imp2 = c2.post(B + "/import", json={"mode": "replace", "config": exp["config"], "ideas": exp["ideas"]}).json()
+    ok(imp2["ideas_written"] == 1 and imp2["config_updated"], "fresh replace import writes config and ideas")
+    cfg2 = c2.get(B + "/config").json()
+    ok(any(s["id"] == src["id"] for s in cfg2["source_types"]), "fresh replace import restores custom source types")
+    ok(c2.get(B + "/ideas?source_type=" + src["id"]).json()["count"] == 1, "fresh replace import preserves custom idea source_type")
 
     print(f"\nALL {PASSED} SMOKE TESTS PASSED")
     return 0

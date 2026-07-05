@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -72,20 +73,20 @@ _DEFAULT_CATEGORIES: List[Dict[str, Any]] = []
 
 _PRIORITIES = ["", "low", "maybe", "high", "urgent"]
 
-# Where an idea came from. Fixed list (served in /config); "" = unset.
-SOURCE_TYPES: List[Dict[str, str]] = [
-    {"id": "", "label": "—"},
-    {"id": "reddit", "label": "Reddit"},
-    {"id": "twitter", "label": "Twitter / X"},
-    {"id": "hackernews", "label": "Hacker News"},
-    {"id": "email", "label": "Email"},
-    {"id": "slack", "label": "Slack"},
-    {"id": "client", "label": "Client"},
-    {"id": "internal", "label": "Internal"},
-    {"id": "web", "label": "Web"},
-    {"id": "other", "label": "Other"},
+# Where an idea came from. Stored in config so they're user-editable; seeded on
+# first run (and lazily for pre-existing installs). "" (unset) is always allowed
+# and is prepended by /config as the "—" option — it is not stored here.
+_DEFAULT_SOURCE_TYPES: List[Dict[str, str]] = [
+    {"id": "reddit", "label": "Reddit", "emoji": "👽"},
+    {"id": "twitter", "label": "Twitter / X", "emoji": "🐦"},
+    {"id": "hackernews", "label": "Hacker News", "emoji": "📰"},
+    {"id": "email", "label": "Email", "emoji": "✉️"},
+    {"id": "slack", "label": "Slack", "emoji": "💬"},
+    {"id": "client", "label": "Client", "emoji": "💼"},
+    {"id": "internal", "label": "Internal", "emoji": "🏠"},
+    {"id": "web", "label": "Web", "emoji": "🌐"},
+    {"id": "other", "label": "Other", "emoji": "🔖"},
 ]
-_SOURCE_IDS = {s["id"] for s in SOURCE_TYPES}
 
 # Item templates prefill the new-idea form. Stored in config so they're
 # user-editable; seeded on first run (and lazily for pre-existing installs).
@@ -174,6 +175,7 @@ def _ensure_layout() -> None:
                 "categories": _clone(_DEFAULT_CATEGORIES),
                 "statuses": _clone(_DEFAULT_STATUSES),
                 "templates": _clone(_DEFAULT_TEMPLATES),
+                "source_types": _clone(_DEFAULT_SOURCE_TYPES),
             },
         )
 
@@ -189,9 +191,11 @@ def _load_config() -> Dict[str, Any]:
         cfg = {}
     cfg.setdefault("categories", [])
     cfg.setdefault("statuses", [])
-    # Lazily seed templates for installs created before templates existed.
+    # Lazily seed fields for installs created before they existed.
     if "templates" not in cfg:
         cfg["templates"] = _clone(_DEFAULT_TEMPLATES)
+    if "source_types" not in cfg:
+        cfg["source_types"] = _clone(_DEFAULT_SOURCE_TYPES)
     return cfg
 
 
@@ -217,6 +221,44 @@ def _load_idea(idea_id: str) -> Dict[str, Any]:
     return data
 
 
+def _clean_url(value: Any) -> str:
+    """Return a safe absolute source URL, or blank it.
+
+    Source URLs are rendered as anchors in the dashboard, so only absolute
+    http(s) URLs are accepted. Everything else is treated as empty rather
+    than being stored or returned to the browser as a clickable href.
+    """
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    if any(ch.isspace() for ch in raw):
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if not parsed.netloc:
+        return ""
+    return raw
+
+
+def _clean_promoted_to_kanban(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    draft = dict(value)
+    draft["source_url"] = _clean_url(draft.get("source_url"))
+    return draft
+
+
+def _idea_for_output(idea: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a browser/export-safe copy of an idea without mutating storage."""
+    out = dict(idea)
+    out["source_url"] = _clean_url(out.get("source_url"))
+    out["promoted_to_kanban"] = _clean_promoted_to_kanban(out.get("promoted_to_kanban"))
+    return out
+
+
 def _idea_summary(idea: Dict[str, Any]) -> Dict[str, Any]:
     """Trim heavy fields for list responses."""
     return {
@@ -226,19 +268,22 @@ def _idea_summary(idea: Dict[str, Any]) -> Dict[str, Any]:
         "subcategory": idea.get("subcategory"),
         "status": idea.get("status"),
         "priority": idea.get("priority", ""),
-        "source_url": idea.get("source_url", ""),
+        "source_url": _clean_url(idea.get("source_url", "")),
         "source_type": idea.get("source_type", ""),
         "summary": idea.get("summary", ""),
         "tags": idea.get("tags", []),
         "update_count": len(idea.get("updates", [])),
         "created_at": idea.get("created_at"),
         "updated_at": idea.get("updated_at"),
-        "promoted_to_kanban": idea.get("promoted_to_kanban"),
+        "promoted_to_kanban": _clean_promoted_to_kanban(idea.get("promoted_to_kanban")),
     }
 
 
 def _clean_source_type(value: Any) -> str:
-    return value if value in _SOURCE_IDS else ""
+    if not value:
+        return ""
+    ids = {s.get("id") for s in _load_config().get("source_types", [])}
+    return value if value in ids else ""
 
 
 def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -273,7 +318,7 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
         "subcategory": raw.get("subcategory") or None,
         "status": raw.get("status") or _DEFAULT_STATUSES[0]["id"],
         "priority": priority if priority in _PRIORITIES else "",
-        "source_url": str(raw.get("source_url") or "").strip(),
+        "source_url": _clean_url(raw.get("source_url")),
         "source_type": _clean_source_type(raw.get("source_type")),
         "summary": str(raw.get("summary") or "").strip(),
         "notes_markdown": str(raw.get("notes_markdown") or ""),
@@ -281,7 +326,7 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
         "updates": updates,
         "created_at": str(raw.get("created_at") or now),
         "updated_at": str(raw.get("updated_at") or now),
-        "promoted_to_kanban": raw.get("promoted_to_kanban"),
+        "promoted_to_kanban": _clean_promoted_to_kanban(raw.get("promoted_to_kanban")),
     }
 
 
@@ -306,6 +351,16 @@ class StatusIn(BaseModel):
 class StatusPatch(BaseModel):
     label: Optional[str] = Field(default=None, max_length=60)
     color: Optional[str] = Field(default=None, max_length=32)
+
+
+class SourceTypeIn(BaseModel):
+    label: str = Field(min_length=1, max_length=60)
+    emoji: str = Field(default="", max_length=8)
+
+
+class SourceTypePatch(BaseModel):
+    label: Optional[str] = Field(default=None, max_length=60)
+    emoji: Optional[str] = Field(default=None, max_length=8)
 
 
 class IdeaIn(BaseModel):
@@ -384,7 +439,8 @@ async def get_config() -> Dict[str, Any]:
         "statuses": cfg["statuses"],
         "templates": cfg.get("templates", []),
         "priorities": _PRIORITIES,
-        "source_types": SOURCE_TYPES,
+        # Prepend the always-available "unset" option; the rest are editable.
+        "source_types": [{"id": "", "label": "—", "emoji": ""}] + cfg.get("source_types", []),
     }
 
 
@@ -518,6 +574,50 @@ async def delete_status(status_id: str) -> Dict[str, Any]:
     return {"ok": True}
 
 
+# ---- Source types ---------------------------------------------------------- #
+
+
+@router.post("/source-types")
+async def add_source_type(body: SourceTypeIn) -> Dict[str, Any]:
+    with _LOCK:
+        cfg = _load_config()
+        items = cfg.setdefault("source_types", [])
+        base = _slugify(body.label)
+        st_id, n = base, 2
+        existing = {s["id"] for s in items}
+        while st_id in existing:
+            st_id, n = f"{base}-{n}", n + 1
+        item = {"id": st_id, "label": body.label.strip(), "emoji": (body.emoji or "").strip()}
+        items.append(item)
+        _save_config(cfg)
+    return item
+
+
+@router.patch("/source-types/{source_id}")
+async def edit_source_type(source_id: str, body: SourceTypePatch) -> Dict[str, Any]:
+    with _LOCK:
+        cfg = _load_config()
+        item = next((s for s in cfg.get("source_types", []) if s["id"] == source_id), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="source type not found")
+        if body.label is not None:
+            item["label"] = body.label.strip()
+        if body.emoji is not None:
+            item["emoji"] = body.emoji.strip()
+        _save_config(cfg)
+    return item
+
+
+@router.delete("/source-types/{source_id}")
+async def delete_source_type(source_id: str) -> Dict[str, Any]:
+    with _LOCK:
+        cfg = _load_config()
+        cfg["source_types"] = [s for s in cfg.get("source_types", []) if s["id"] != source_id]
+        _save_config(cfg)
+    # Ideas keep any now-removed source_type value; it simply shows as its raw id.
+    return {"ok": True}
+
+
 # ---- Ideas ----------------------------------------------------------------- #
 
 
@@ -572,7 +672,7 @@ async def list_ideas(
 @router.get("/ideas/{idea_id}")
 async def get_idea(idea_id: str) -> Dict[str, Any]:
     with _LOCK:
-        return _load_idea(idea_id)
+        return _idea_for_output(_load_idea(idea_id))
 
 
 @router.post("/ideas")
@@ -585,7 +685,7 @@ async def create_idea(body: IdeaIn) -> Dict[str, Any]:
         "subcategory": body.subcategory,
         "status": body.status or (_DEFAULT_STATUSES[0]["id"]),
         "priority": body.priority if body.priority in _PRIORITIES else "",
-        "source_url": body.source_url.strip(),
+        "source_url": _clean_url(body.source_url),
         "source_type": _clean_source_type(body.source_type),
         "summary": body.summary.strip(),
         "notes_markdown": body.notes_markdown,
@@ -598,7 +698,7 @@ async def create_idea(body: IdeaIn) -> Dict[str, Any]:
     with _LOCK:
         _ensure_layout()
         _atomic_write(_idea_path(idea["id"]), idea)
-    return idea
+    return _idea_for_output(idea)
 
 
 @router.patch("/ideas/{idea_id}")
@@ -614,7 +714,9 @@ async def update_idea(idea_id: str, body: IdeaPatch) -> Dict[str, Any]:
             changes["source_type"] = _clean_source_type(changes["source_type"])
         if "tags" in changes and changes["tags"] is not None:
             changes["tags"] = [t.strip() for t in changes["tags"] if t and t.strip()]
-        for key in ("title", "source_url", "summary"):
+        if "source_url" in changes:
+            changes["source_url"] = _clean_url(changes["source_url"])
+        for key in ("title", "summary"):
             if key in changes and isinstance(changes[key], str):
                 changes[key] = changes[key].strip()
 
@@ -631,7 +733,7 @@ async def update_idea(idea_id: str, body: IdeaPatch) -> Dict[str, Any]:
                 }
             )
         _atomic_write(_idea_path(idea_id), idea)
-    return idea
+    return _idea_for_output(idea)
 
 
 @router.delete("/ideas/{idea_id}")
@@ -652,7 +754,7 @@ async def add_update(idea_id: str, body: UpdateIn) -> Dict[str, Any]:
         idea.setdefault("updates", []).append(entry)
         idea["updated_at"] = entry["at"]
         _atomic_write(_idea_path(idea_id), idea)
-    return idea
+    return _idea_for_output(idea)
 
 
 # ---- Promote to Kanban (draft only) --------------------------------------- #
@@ -662,8 +764,9 @@ def _draft_markdown(idea: Dict[str, Any], criteria: List[str]) -> str:
     lines = ["# " + (idea.get("title") or "(untitled)"), ""]
     if idea.get("summary"):
         lines += [idea["summary"], ""]
-    if idea.get("source_url"):
-        lines += ["**Source:** " + idea["source_url"], ""]
+    source_url = _clean_url(idea.get("source_url"))
+    if source_url:
+        lines += ["**Source:** " + source_url, ""]
     lines += ["## Acceptance criteria"]
     lines += ["- [ ] " + c for c in criteria]
     lines += ["", "_Idea ref: " + idea.get("id", "") + "_"]
@@ -695,7 +798,7 @@ async def promote_draft(idea_id: str, body: Optional[PromoteIn] = None) -> Dict[
             "drafted_at": now,
             "title": idea.get("title", ""),
             "summary": idea.get("summary", ""),
-            "source_url": idea.get("source_url", ""),
+            "source_url": _clean_url(idea.get("source_url")),
             "acceptance_criteria": criteria,
             "idea_ref": idea_id,
             "markdown": _draft_markdown(idea, criteria),
@@ -706,7 +809,7 @@ async def promote_draft(idea_id: str, body: Optional[PromoteIn] = None) -> Dict[
             {"at": now, "by": "system", "body": "Kanban card draft generated (not dispatched)"}
         )
         _atomic_write(_idea_path(idea_id), idea)
-    return {"idea": idea, "draft": draft}
+    return {"idea": _idea_for_output(idea), "draft": draft}
 
 
 # ---- Templates ------------------------------------------------------------- #
@@ -778,7 +881,7 @@ async def export_all() -> Dict[str, Any]:
         for path in sorted(IDEAS_DIR.glob("idea_*.json")):
             data = _read_json(path, None)
             if isinstance(data, dict):
-                ideas.append(data)
+                ideas.append(_idea_for_output(data))
     return {"version": 1, "exported_at": _now(), "config": cfg, "ideas": ideas}
 
 
@@ -807,9 +910,10 @@ async def import_all(body: ImportIn) -> Dict[str, Any]:
                     "categories": inc.get("categories", []),
                     "statuses": inc.get("statuses", []),
                     "templates": inc.get("templates", cfg.get("templates", [])),
+                    "source_types": inc.get("source_types", cfg.get("source_types", _clone(_DEFAULT_SOURCE_TYPES))),
                 }
             else:  # merge by id
-                for key in ("categories", "statuses", "templates"):
+                for key in ("categories", "statuses", "templates", "source_types"):
                     existing = cfg.setdefault(key, [])
                     have = {x.get("id") for x in existing}
                     for item in inc.get(key, []) or []:
