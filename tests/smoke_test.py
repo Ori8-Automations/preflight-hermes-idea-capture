@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-DASHBOARD = HERE.parent / "preflight-idea-capture" / "dashboard"
+DASHBOARD = HERE.parent / "dashboard"
 
 PASSED = 0
 

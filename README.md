@@ -65,11 +65,11 @@ types — all editable.
 
 ## Install
 
-Copy the `preflight-idea-capture/` directory into your Hermes plugins path,
-enable it, and (re)start the dashboard:
+Clone this repository into your Hermes plugins path, or copy the repository
+directory there, then enable it and (re)start the dashboard:
 
 ```bash
-cp -r preflight-idea-capture ~/.hermes/plugins/
+git clone https://github.com/ori8automations/preflight-hermes-idea-capture.git ~/.hermes/plugins/preflight-idea-capture
 hermes plugins enable preflight-idea-capture
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open
 ```
@@ -91,17 +91,22 @@ curl http://127.0.0.1:9119/api/dashboard/plugins/rescan
 
 The **Preflight** tab appears in the dashboard nav.
 
+> Repo layout note: `plugin.yaml` intentionally lives at the repository root so
+> dashboard/CLI installs using plain `ori8automations/preflight-hermes-idea-capture`
+> can discover the plugin without requiring a subdirectory path.
+
 ## Layout
 
 ```
-preflight-idea-capture/
+preflight-hermes-idea-capture/
 ├── plugin.yaml            # root plugin metadata (name, version, permissions)
-└── dashboard/
-    ├── manifest.json      # dashboard manifest (tab, entry, api)
-    ├── dist/
-    │   ├── index.js       # frontend (no build step; uses the Hermes Plugin SDK)
-    │   └── style.css      # scoped styles, dark-mode first
-    └── plugin_api.py      # FastAPI router — mounted at /api/plugins/preflight-idea-capture/
+├── dashboard/
+│   ├── manifest.json      # dashboard manifest (tab, entry, api)
+│   ├── dist/
+│   │   ├── index.js       # frontend (no build step; uses the Hermes Plugin SDK)
+│   │   └── style.css      # scoped styles, dark-mode first
+│   └── plugin_api.py      # FastAPI router — mounted at /api/plugins/preflight-idea-capture/
+└── tests/
 ```
 
 ## Data & storage

@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DASH="$ROOT/preflight-idea-capture/dashboard"
+DASH="$ROOT/dashboard"
 
 pick_python() {
   local candidates=()
