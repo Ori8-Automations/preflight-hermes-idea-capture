@@ -23,9 +23,17 @@ signal / thought / maybe
 Preflight owns the first two steps and stops there — promoting to Kanban is an
 explicit, human action (and even then it only drafts a card for you to copy).
 
-<!-- Add a screenshot here once you've deployed it, e.g.:
-![Preflight](docs/screenshot.png)
--->
+## Screenshots
+
+![Preflight dashboard](docs/assets/screenshots/preflight_dashboard.png)
+
+| Capture flow | Manage sources |
+|---|---|
+| ![New idea form](docs/assets/screenshots/preflight_newidea.png) | ![Source type management](docs/assets/screenshots/preflight_sources.png) |
+
+| Statuses and templates | Data import/export |
+|---|---|
+| ![Status and template management](docs/assets/screenshots/preflight_statustemplates.png) | ![Data import and export](docs/assets/screenshots/preflight_data.png) |
 
 ## Features
 
