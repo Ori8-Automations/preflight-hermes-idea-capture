@@ -91,6 +91,37 @@
     }
   }
 
+  function copyTextToClipboard(text) {
+    text = String(text || "");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(function () { return true; }, function () {
+        return fallbackCopyText(text);
+      });
+    }
+    return Promise.resolve(fallbackCopyText(text));
+  }
+
+  function fallbackCopyText(text) {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.left = "0";
+    ta.style.width = "1px";
+    ta.style.height = "1px";
+    ta.style.opacity = "0";
+    ta.style.fontSize = "16px"; // avoid iOS zoom/focus weirdness
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
   function hostOf(url) {
     var safe = cleanUrl(url);
     try { return new URL(safe).hostname.replace(/^www\./, ""); } catch (e) { return safe; }
@@ -523,10 +554,9 @@
       return loc.origin + loc.pathname + loc.search + "#idea=" + encodeURIComponent(idea.id);
     }
     function copyText(text, label) {
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text);
-      } catch (e) { /* clipboard may be unavailable */ }
-      setCopied(label);
+      copyTextToClipboard(text).then(function (ok) {
+        setCopied(ok ? label : "copy failed — select text");
+      });
     }
     function copyLink() { copyText(ideaLink(), "link"); }
     function copyMarkdown() {
@@ -607,8 +637,8 @@
 
       h("div", { className: "ic-detail-actions" },
         h("button", { className: "ic-btn ic-btn-primary", disabled: !dirty, onClick: saveText }, dirty ? "Save changes" : "Saved"),
-        h("button", { className: "ic-btn ic-btn-ghost", title: "Generate a Kanban card draft to copy (nothing is dispatched automatically).", onClick: function () { props.onPromote(idea.id); } },
-          idea.promoted_to_kanban ? "View Kanban draft" : "Draft Kanban card"),
+        h("button", { className: "ic-btn ic-btn-ghost", title: "Generate a Kanban card draft and open a copyable draft sheet (nothing is dispatched automatically).", onClick: function () { props.onPromote(idea.id); } },
+          idea.promoted_to_kanban ? "View draft / copy Kanban card" : "Draft / copy Kanban card"),
         idea.promoted_to_kanban ? h("span", { className: "ic-drafted" }, "✓ drafted " + timeAgo(idea.promoted_to_kanban.drafted_at)) : null,
         h("span", { className: "ic-spacer" }),
         h("button", { className: "ic-btn ic-btn-danger", onClick: function () { if (window.confirm("Delete this idea permanently?")) props.onDelete(idea.id); } }, "Delete")
@@ -806,6 +836,7 @@
     var qa = useState(false); var quickOpen = qa[0], setQuickOpen = qa[1];
     var qc = useState(false); var captureOpen = qc[0], setCaptureOpen = qc[1];
     var dm = useState(null); var draft = dm[0], setDraft = dm[1];
+    var dc = useState(""); var draftCopied = dc[0], setDraftCopied = dc[1];
     var ex = useState(false); var expanded = ex[0], setExpanded = ex[1];
 
     var loadConfig = useCallback(function () {
@@ -892,6 +923,7 @@
       return refreshAfter(req("POST", "/ideas", form));
     }
     function promoteDraft(id) {
+      setDraftCopied("");
       return req("POST", "/ideas/" + id + "/promote-draft", {}).then(function (r) {
         setDetail(r.idea); loadIdeas(); setDraft(r.draft); return r;
       }, function (e) { setError(String(e && e.message || e)); });
@@ -1011,16 +1043,17 @@
       );
     }
 
-    var draftModal = draft ? h(Modal, { title: "Kanban card draft", onClose: function () { setDraft(null); } },
-      h("p", { className: "ic-muted ic-small" }, "This is a draft to copy into Kanban — nothing was created or dispatched automatically."),
-      h("textarea", { className: "ic-input ic-draft-text", readOnly: true, value: draft.markdown }),
+    var draftModal = draft ? h(Modal, { title: "Kanban card draft", onClose: function () { setDraft(null); setDraftCopied(""); } },
+      h("p", { className: "ic-muted ic-small" }, "This is a draft/copy sheet for Kanban — nothing was created or dispatched automatically."),
+      h("textarea", { className: "ic-input ic-draft-text", readOnly: true, value: draft.markdown, onFocus: function (e) { e.target.select(); } }),
+      draftCopied ? h("p", { className: "ic-copied ic-draft-copy-status" }, draftCopied) : null,
       h("div", { className: "ic-modal-actions" },
         h("button", { className: "ic-btn ic-btn-primary", onClick: function () {
-          try {
-            if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(draft.markdown); }
-          } catch (e) { /* clipboard may be unavailable; text is selectable */ }
-        } }, "Copy to clipboard"),
-        h("button", { className: "ic-btn ic-btn-ghost", onClick: function () { setDraft(null); } }, "Close")
+          copyTextToClipboard(draft.markdown).then(function (ok) {
+            setDraftCopied(ok ? "Copied Kanban draft ✓" : "Copy failed — select the draft text and use system copy.");
+          });
+        } }, draftCopied ? "Copy again" : "Copy draft to clipboard"),
+        h("button", { className: "ic-btn ic-btn-ghost", onClick: function () { setDraft(null); setDraftCopied(""); } }, "Close")
       )
     ) : null;
 

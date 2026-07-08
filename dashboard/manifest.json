@@ -3,7 +3,7 @@
   "label": "Preflight",
   "description": "Preflight — a lightweight idea/backlog capture surface for the Hermes Dashboard. Category → Subcategory → Idea, with notes, status, source type, templates, and an update timeline. A staging area before Kanban.",
   "icon": "Plane",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "tab": {
     "path": "/preflight",
     "position": "after:skills"
