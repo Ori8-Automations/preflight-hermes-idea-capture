@@ -109,6 +109,7 @@ textarea.ic-input { resize: vertical; }
 .ic-card-meta { display: flex; align-items: center; gap: 8px; margin-top: 9px; flex-wrap: wrap; }
 .ic-chip { font-size: 11px; color: var(--ic-muted); background: var(--ic-panel-2); border: 1px solid var(--ic-border); border-radius: 6px; padding: 1px 7px; }
 .ic-chip-sub { opacity: .85; }
+.ic-chip-archived { color: #f59e0b; border-color: #f59e0b; background: #f59e0b1f; }
 .ic-tag { font-size: 11px; color: var(--ic-accent); }
 .ic-prio { font-size: 11px; font-weight: 600; }
 .ic-src { font-size: 11px; color: var(--ic-muted); text-decoration: none; }

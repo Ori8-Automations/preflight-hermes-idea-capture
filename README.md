@@ -52,6 +52,10 @@ explicit, human action (and even then it only drafts a card for you to copy).
 - **Draft a Kanban card** — generate a copy-ready card draft (title, summary,
   source, acceptance-criteria checklist, and an idea back-reference). It's a
   draft only; nothing is created or dispatched automatically.
+- **Archive** — once an idea is done (or no longer relevant), archive it to
+  hide it from the dashboard without deleting it. A toolbar toggle switches
+  between Active (default), Archived, and All, and archiving/unarchiving is
+  logged on the idea's update timeline.
 - **Custom statuses** (with colors), **custom source types**, and
   **export/import** of the whole dataset as a single JSON file — all managed
   from the **Manage** view.
@@ -169,7 +173,9 @@ with **Import** (merge or replace).
   "updates": [{ "at": "2026-01-01T00:00:00Z", "by": "me", "body": "…" }],
   "created_at": "…",
   "updated_at": "…",
-  "promoted_to_kanban": null
+  "promoted_to_kanban": null,
+  "archived": false,
+  "archived_at": null
 }
 ```
 
@@ -184,9 +190,11 @@ with **Import** (merge or replace).
 | POST/PATCH/DELETE | `/statuses[/{id}]` | Manage custom statuses |
 | POST/PATCH/DELETE | `/source-types[/{id}]` | Manage custom source types |
 | POST/PATCH/DELETE | `/templates[/{id}]` | Manage item templates |
-| GET | `/ideas` | List (supports `category`, `subcategory`, `status`, `source_type`, `q`, `sort`) |
+| GET | `/ideas` | List (supports `category`, `subcategory`, `status`, `source_type`, `q`, `sort`, `archived`) |
 | GET/POST/PATCH/DELETE | `/ideas[/{id}]` | Read/create/edit/delete ideas |
 | POST | `/ideas/{id}/updates` | Append an update to the timeline |
+| POST | `/ideas/{id}/archive` | Archive an idea (hides it from the default list; kept, not deleted) |
+| POST | `/ideas/{id}/unarchive` | Restore an archived idea to the active list |
 | POST | `/ideas/{id}/promote-draft` | Generate a Kanban card draft (draft only) |
 | GET | `/export` | Export the full dataset (config + all ideas) as JSON |
 | POST | `/import` | Import a dataset (`mode`: `merge` or `replace`) |

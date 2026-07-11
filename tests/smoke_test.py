@@ -91,9 +91,27 @@ def main() -> int:
     upd = c.post(B + f"/ideas/{iid}/updates", json={"body": "looked into it"}).json()
     ok(upd["updates"][-1]["by"] == "me", "append update (default author 'me')")
 
+    # --- archive / unarchive: hides completed ideas from the dashboard without deleting them ---
+    arc_idea = c.post(B + "/ideas", json={"title": "Old idea to archive"}).json()
+    aid = arc_idea["id"]
+    ok(arc_idea["archived"] is False, "ideas are created unarchived")
+    ok(c.get(B + "/ideas").json()["count"] == 2, "default list includes the idea before archiving")
+    archived = c.post(B + f"/ideas/{aid}/archive").json()
+    ok(archived["archived"] is True and archived["archived_at"], "archive sets archived + archived_at")
+    ok(c.get(B + "/ideas").json()["count"] == 1, "default list excludes archived ideas")
+    ok(c.get(B + "/ideas?archived=true").json()["count"] == 1, "archived=true lists only archived ideas")
+    ok(c.get(B + "/ideas?archived=all").json()["count"] == 2, "archived=all lists everything")
+    ok(any(u["body"] == "Archived" for u in c.get(B + f"/ideas/{aid}").json()["updates"]), "archiving logs a timeline update")
+    unarchived = c.post(B + f"/ideas/{aid}/unarchive").json()
+    ok(unarchived["archived"] is False and unarchived["archived_at"] is None, "unarchive clears archived + archived_at")
+    ok(c.get(B + "/ideas").json()["count"] == 2, "default list includes the idea again after unarchive")
+    c.delete(B + f"/ideas/{aid}")
+    ok(c.get(B + "/ideas").json()["count"] == 1, "cleanup: archive-test idea removed")
+
     # --- export / import round-trip ---
     exp = c.get(B + "/export").json()
     ok("config" in exp and "ideas" in exp and len(exp["ideas"]) == 1, "export bundle (top-level config/ideas)")
+    ok(exp["ideas"][0]["archived"] is False, "export includes archived state")
     ok(any(s["id"] == src["id"] for s in exp["config"].get("source_types", [])), "export includes custom source types")
     ok(c.post(B + "/import", json={"mode": "replace", "ideas": []}).status_code == 200, "import replace clears")
     ok(c.get(B + "/ideas").json()["count"] == 0, "ideas cleared")

@@ -276,6 +276,8 @@ def _idea_summary(idea: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": idea.get("created_at"),
         "updated_at": idea.get("updated_at"),
         "promoted_to_kanban": _clean_promoted_to_kanban(idea.get("promoted_to_kanban")),
+        "archived": bool(idea.get("archived", False)),
+        "archived_at": idea.get("archived_at"),
     }
 
 
@@ -311,6 +313,7 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     tags = [str(t).strip() for t in (raw.get("tags") or []) if str(t).strip()]
     priority = raw.get("priority", "")
+    archived = bool(raw.get("archived", False))
     return {
         "id": idea_id,
         "title": str(raw.get("title") or "(untitled)").strip()[:300],
@@ -327,6 +330,8 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": str(raw.get("created_at") or now),
         "updated_at": str(raw.get("updated_at") or now),
         "promoted_to_kanban": _clean_promoted_to_kanban(raw.get("promoted_to_kanban")),
+        "archived": archived,
+        "archived_at": str(raw["archived_at"]) if archived and raw.get("archived_at") else None,
     }
 
 
@@ -629,6 +634,7 @@ async def list_ideas(
     source_type: Optional[str] = None,
     q: Optional[str] = None,
     sort: str = "updated",
+    archived: str = "false",
 ) -> Dict[str, Any]:
     with _LOCK:
         _ensure_layout()
@@ -638,6 +644,10 @@ async def list_ideas(
             if isinstance(data, dict):
                 items.append(data)
 
+    if archived == "true":
+        items = [i for i in items if i.get("archived")]
+    elif archived != "all":
+        items = [i for i in items if not i.get("archived")]
     if category:
         items = [i for i in items if i.get("category") == category]
     if subcategory:
@@ -694,6 +704,8 @@ async def create_idea(body: IdeaIn) -> Dict[str, Any]:
         "created_at": now,
         "updated_at": now,
         "promoted_to_kanban": None,
+        "archived": False,
+        "archived_at": None,
     }
     with _LOCK:
         _ensure_layout()
@@ -744,6 +756,35 @@ async def delete_idea(idea_id: str) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail="idea not found")
         path.unlink()
     return {"ok": True}
+
+
+@router.post("/ideas/{idea_id}/archive")
+async def archive_idea(idea_id: str) -> Dict[str, Any]:
+    """Archive an idea: hides it from the default list without deleting it."""
+    with _LOCK:
+        idea = _load_idea(idea_id)
+        if not idea.get("archived"):
+            now = _now()
+            idea["archived"] = True
+            idea["archived_at"] = now
+            idea["updated_at"] = now
+            idea.setdefault("updates", []).append({"at": now, "by": "system", "body": "Archived"})
+            _atomic_write(_idea_path(idea_id), idea)
+    return _idea_for_output(idea)
+
+
+@router.post("/ideas/{idea_id}/unarchive")
+async def unarchive_idea(idea_id: str) -> Dict[str, Any]:
+    with _LOCK:
+        idea = _load_idea(idea_id)
+        if idea.get("archived"):
+            now = _now()
+            idea["archived"] = False
+            idea["archived_at"] = None
+            idea["updated_at"] = now
+            idea.setdefault("updates", []).append({"at": now, "by": "system", "body": "Unarchived"})
+            _atomic_write(_idea_path(idea_id), idea)
+    return _idea_for_output(idea)
 
 
 @router.post("/ideas/{idea_id}/updates")

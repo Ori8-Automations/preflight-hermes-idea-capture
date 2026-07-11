@@ -289,6 +289,7 @@
     },
       h("div", { className: "ic-card-top" },
         h("div", { className: "ic-card-title" }, idea.title || "(untitled)"),
+        idea.archived ? h("span", { className: "ic-chip ic-chip-archived" }, "🗄 Archived") : null,
         h(StatusBadge, { status: idea.status, statuses: props.statuses })
       ),
       idea.summary ? h("div", { className: "ic-card-summary" }, idea.summary) : null,
@@ -581,6 +582,7 @@
       h("div", { className: "ic-detail-head" },
         h("input", { className: "ic-title-input", value: draft.title, onChange: function (e) { setD("title", e.target.value); } }),
         h("div", { className: "ic-detail-head-actions" },
+          idea.archived ? h("span", { className: "ic-chip ic-chip-archived" }, "🗄 Archived") : null,
           copied ? h("span", { className: "ic-copied" }, "Copied " + copied + " ✓") : null,
           h("button", { className: "ic-icon-btn", title: "Copy share link", onClick: copyLink }, "🔗"),
           h("button", { className: "ic-icon-btn", title: "Copy as Markdown (for Telegram/agents)", onClick: copyMarkdown }, "⧉"),
@@ -641,6 +643,9 @@
           idea.promoted_to_kanban ? "View draft / copy Kanban card" : "Draft / copy Kanban card"),
         idea.promoted_to_kanban ? h("span", { className: "ic-drafted" }, "✓ drafted " + timeAgo(idea.promoted_to_kanban.drafted_at)) : null,
         h("span", { className: "ic-spacer" }),
+        idea.archived
+          ? h("button", { className: "ic-btn", title: "Bring this idea back to the active dashboard", onClick: function () { props.onUnarchive(idea.id); } }, "Unarchive")
+          : h("button", { className: "ic-btn", title: "Hide this idea from the active dashboard (kept, not deleted)", onClick: function () { props.onArchive(idea.id); } }, "Archive"),
         h("button", { className: "ic-btn ic-btn-danger", onClick: function () { if (window.confirm("Delete this idea permanently?")) props.onDelete(idea.id); } }, "Delete")
       ),
 
@@ -829,7 +834,7 @@
     var ld = useState(true); var loading = ld[0], setLoading = ld[1];
     var er = useState(null); var error = er[0], setError = er[1];
     var vw = useState("ideas"); var view = vw[0], setView = vw[1];
-    var flt = useState({ category: null, subcategory: null, status: "", source_type: "", q: "", sort: "updated" });
+    var flt = useState({ category: null, subcategory: null, status: "", source_type: "", q: "", sort: "updated", archived: "active" });
     var filter = flt[0], setFilter = flt[1];
     var sel = useState(null); var selectedId = sel[0], setSelectedId = sel[1];
     var det = useState(null); var detail = det[0], setDetail = det[1];
@@ -843,7 +848,9 @@
       return req("GET", "/config").then(setConfig);
     }, []);
     var loadIdeas = useCallback(function () {
-      return req("GET", "/ideas").then(function (r) { setIdeas(r.ideas || []); });
+      // Fetch every idea regardless of archived state — the archived/active
+      // split is applied client-side, same as the other filters below.
+      return req("GET", "/ideas?archived=all").then(function (r) { setIdeas(r.ideas || []); });
     }, []);
 
     useEffect(function () {
@@ -874,9 +881,19 @@
       return function () { window.removeEventListener("hashchange", openFromHash); };
     }, []);
 
+    // Archived/active split, applied before the other filters so the sidebar
+    // counts and the visible list agree on what's "in scope" right now.
+    var scoped = useMemo(function () {
+      return ideas.filter(function (i) {
+        if (filter.archived === "archived") return !!i.archived;
+        if (filter.archived === "all") return true;
+        return !i.archived; // "active" (default): archived ideas stay off the dashboard
+      });
+    }, [ideas, filter.archived]);
+
     // Derived, fully client-side filtered + sorted list.
     var visible = useMemo(function () {
-      var out = ideas.filter(function (i) {
+      var out = scoped.filter(function (i) {
         if (filter.category && i.category !== filter.category) return false;
         if (filter.subcategory && i.subcategory !== filter.subcategory) return false;
         if (filter.status && i.status !== filter.status) return false;
@@ -894,7 +911,7 @@
         return (b.updated_at || "").localeCompare(a.updated_at || "");
       });
       return out;
-    }, [ideas, filter]);
+    }, [scoped, filter]);
 
     function refreshAfter(p) {
       return p.then(function (res) { loadIdeas(); return res; }, function (e) { setError(String(e && e.message || e)); throw e; });
@@ -914,6 +931,12 @@
     }
     function deleteIdea(id) {
       return refreshAfter(req("DELETE", "/ideas/" + id)).then(function () { setSelectedId(null); setDetail(null); });
+    }
+    function archiveIdea(id) {
+      return refreshAfter(req("POST", "/ideas/" + id + "/archive")).then(function (idea) { setDetail(idea); return idea; });
+    }
+    function unarchiveIdea(id) {
+      return refreshAfter(req("POST", "/ideas/" + id + "/unarchive")).then(function (idea) { setDetail(idea); return idea; });
     }
     function addUpdate(id, body, by) {
       return refreshAfter(req("POST", "/ideas/" + id + "/updates", { body: body, by: by })).then(function (idea) { setDetail(idea); return idea; });
@@ -1008,16 +1031,21 @@
           h("option", { value: "updated" }, "Recently updated"),
           h("option", { value: "created" }, "Recently created"),
           h("option", { value: "title" }, "Title A–Z")
+        ),
+        h("select", { className: "ic-input", value: filter.archived, onChange: function (e) { setFilter(Object.assign({}, filter, { archived: e.target.value })); } },
+          h("option", { value: "active" }, "Active"),
+          h("option", { value: "archived" }, "Archived"),
+          h("option", { value: "all" }, "All (active + archived)")
         )
       );
 
       var list = visible.length
         ? visible.map(function (i) { return h(IdeaCard, { key: i.id, idea: i, statuses: config.statuses, categories: config.categories, sourceTypes: config.source_types, active: i.id === selectedId, onClick: function () { setSelectedId(i.id === selectedId ? null : i.id); } }); })
-        : [h("div", { key: "e", className: "ic-empty" }, ideas.length ? "No ideas match these filters." : "No ideas yet — use “⚡ Quick capture” or “+ New idea”.")];
+        : [h("div", { key: "e", className: "ic-empty" }, scoped.length ? "No ideas match these filters." : (filter.archived === "archived" ? "No archived ideas." : "No ideas yet — use “⚡ Quick capture” or “+ New idea”."))];
 
       var showExpanded = detail && expanded;
       body = h("div", { className: "ic-workspace" + (showExpanded ? " ic-workspace-expanded" : "") },
-        showExpanded ? null : h(Sidebar, { categories: config.categories, ideas: ideas, filter: filter, onPick: function (c, s) { setFilter(Object.assign({}, filter, { category: c, subcategory: s })); } }),
+        showExpanded ? null : h(Sidebar, { categories: config.categories, ideas: scoped, filter: filter, onPick: function (c, s) { setFilter(Object.assign({}, filter, { category: c, subcategory: s })); } }),
         showExpanded ? null : h("div", { className: "ic-main" },
           captureOpen ? h(QuickCapture, {
             sourceTypes: config.source_types,
@@ -1038,6 +1066,7 @@
           idea: detail, categories: config.categories, statuses: config.statuses, sourceTypes: config.source_types,
           expanded: expanded, onToggleExpand: function () { setExpanded(!expanded); },
           onPatch: patchIdea, onDelete: deleteIdea, onAddUpdate: addUpdate, onPromote: promoteDraft,
+          onArchive: archiveIdea, onUnarchive: unarchiveIdea,
           onClose: function () { setSelectedId(null); setExpanded(false); },
         }) : null
       );
