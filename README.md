@@ -97,9 +97,16 @@ unchanged.
 - A **grace period** (default 600s) is enforced before an event becomes due, so
   a capture the operator is still editing isn't reviewed mid-thought. A drain
   that runs too early burns no retry budget.
-- **Single-consumer claims**: each event is leased by an atomic rename into
-  `processing/`, so concurrent drains never double-process one event. Abandoned
-  leases are reclaimed. Writes are `fsync`'d with collision-safe temp names.
+- **Single-consumer claims**: each event is leased by an `O_CREAT | O_EXCL`
+  create of its `processing/` path — the kernel guarantees exactly one winner,
+  and losers get `EEXIST`. (Plain `rename` is deliberately *not* used as the
+  claim: it replaces an existing destination, so it cannot express "claim only
+  if unclaimed".) The lease owner and timestamp are written as part of that same
+  create, so a processing file is never visible without a lease — closing the
+  window where a concurrent reclaim would judge it stale and resurrect an event
+  another worker was already handling. An unstamped lease is never treated as
+  stale, expired leases are reclaimed, and a displaced owner is blocked from
+  writing its result. Writes are `fsync`'d with collision-safe temp names.
 - **Bounded retries** everywhere, including the no-route case, and **retention
   pruning** actually runs on each drain.
 

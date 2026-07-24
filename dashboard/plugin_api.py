@@ -1211,36 +1211,94 @@ def _event_is_due(event: Dict[str, Any]) -> bool:
 
 
 def _claim_event(event_id: str) -> Optional[Dict[str, Any]]:
-    """Atomically claim a pending event by moving it to ``processing``.
+    """Exclusively claim a pending event for this worker.
 
-    ``os.rename`` is the claim: exactly one caller can move a given path, so two
-    concurrent drains cannot both take the same event. Returns the claimed event
-    or None if another worker got there first.
+    The claim primitive is an ``O_CREAT | O_EXCL`` create of the ``processing``
+    path: the kernel guarantees exactly one caller wins, and a loser gets
+    ``EEXIST``. Plain ``os.rename`` is NOT used here — rename silently replaces
+    an existing destination, so it cannot express "claim only if unclaimed".
+
+    The lease (owner + timestamp) is written as part of that same create, so the
+    processing file is never visible without a lease. That closes the window
+    where a concurrent ``_reclaim_stale_leases()`` would see an unstamped file,
+    judge it infinitely stale, and resurrect an event that an active owner was
+    already processing.
+
+    Crash safety: if we die between creating ``processing`` and unlinking
+    ``pending``, both copies exist. The pending copy cannot be re-claimed (the
+    exclusive create fails), and lease expiry eventually returns the event to
+    pending — so a crash costs a delay, never a double review.
+
+    Returns the claimed event, or None if another worker owns it.
     """
     src = _event_path(EVENTS_PENDING, event_id)
     dst = _event_path(EVENTS_PROCESSING, event_id)
     EVENTS_PROCESSING.mkdir(parents=True, exist_ok=True)
-    try:
-        os.rename(str(src), str(dst))
-    except OSError:
-        return None  # already claimed, or gone
-    ev = _read_json(dst, None)
+
+    ev = _read_json(src, None)
     if not isinstance(ev, dict):
-        return None
+        return None  # already taken, or never there
     ev["status"] = "processing"
     ev["lease_at"] = _now()
-    _atomic_write(dst, ev)
+    ev["lease_owner"] = "own_" + uuid.uuid4().hex[:16]
+
+    payload = json.dumps(ev, indent=2, ensure_ascii=False).encode("utf-8")
+    try:
+        fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return None  # another worker holds the lease
+    except OSError:
+        return None
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    # We own the lease. Retire the pending copy; if it vanished under us, back
+    # the claim out rather than process an event we may not own.
+    try:
+        os.unlink(str(src))
+    except FileNotFoundError:
+        try:
+            os.unlink(str(dst))
+        except OSError:
+            pass
+        return None
     return ev
 
 
+def _lease_is_mine(event: Dict[str, Any]) -> bool:
+    """True if this worker still owns the event's processing lease.
+
+    Checked before any result is written, so an owner whose lease was reclaimed
+    (or taken over after a crash) cannot also apply its outcome.
+    """
+    owner = event.get("lease_owner")
+    if not owner:
+        return True  # not lease-tracked (direct process_event call in tests)
+    current = _read_json(_event_path(EVENTS_PROCESSING, event["event_id"]), None)
+    if not isinstance(current, dict):
+        return False
+    return current.get("lease_owner") == owner
+
+
 def _reclaim_stale_leases(max_lease_seconds: int = 900) -> int:
-    """Return events abandoned mid-processing (crashed worker) to ``pending``."""
+    """Return events abandoned mid-processing (crashed worker) to ``pending``.
+
+    Only leases older than ``max_lease_seconds`` are reclaimed. A lease with no
+    timestamp is deliberately NOT treated as stale — failing closed here is what
+    prevents resurrecting an event that an active owner is still processing.
+    """
     recovered = 0
     for ev in _iter_events(EVENTS_PROCESSING):
         leased = _parse_ts(ev.get("lease_at"))
-        if leased is None or (_now_dt() - leased).total_seconds() > max_lease_seconds:
+        if leased is None:
+            continue  # never resurrect an unstamped lease
+        if (_now_dt() - leased).total_seconds() > max_lease_seconds:
             ev["status"] = "pending"
             ev["last_error"] = "recovered from stale lease"
+            ev.pop("lease_owner", None)  # invalidate the old owner's claim
             _move_event(ev, EVENTS_PENDING)
             recovered += 1
     return recovered
@@ -1377,6 +1435,13 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         # ends in `failed` once the budget is spent.
         return _retry_or_fail(event, "no reviewer configured", max_attempts)
 
+    # Last check before doing observable work: if our lease was reclaimed, the
+    # event now belongs to someone else. Drop it rather than review it twice.
+    if not _lease_is_mine(event):
+        event["status"] = "abandoned"
+        event["last_error"] = "lease lost before review"
+        return event
+
     try:
         result = _REVIEWER(_idea_for_output(idea)) or {}
     except Exception as exc:  # noqa: BLE001 — bound any adapter failure
@@ -1391,6 +1456,12 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
     review = _build_review_from_result(idea, event["idea_revision"], result,
                                        int(event.get("generation", 1)))
+    # Re-verify ownership after the reviewer ran: a long review could have
+    # outlived its lease, and only the current owner may persist a result.
+    if not _lease_is_mine(event):
+        event["status"] = "abandoned"
+        event["last_error"] = "lease lost during review"
+        return event
     try:
         _apply_review(event["idea_id"], review, "Context review completed.")
     except HTTPException as exc:

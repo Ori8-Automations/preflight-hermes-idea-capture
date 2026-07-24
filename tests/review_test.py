@@ -551,26 +551,67 @@ def main() -> int:
         return reviewer_link_only(idea)
 
     pa_c.set_reviewer(counting_reviewer)
-    for n in range(6):
-        c_c.post(B + "/ideas", json={"title": f"Conc {n}", "source_url": f"https://example.com/c{n}"})
-    threads = [threading.Thread(target=pa_c.drain_pending) for _ in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    ok(len(calls) == 6, f"6 events reviewed exactly once under 4 concurrent drains (got {len(calls)})")
-    ok(len(set(calls)) == 6, "no event was processed twice")
-    counts = c_c.get(B + "/review-events").json()["counts"]
-    ok(counts["pending"] == 0 and counts["processing"] == 0, "no events stranded after concurrent drain")
-    ok(counts["delivered"] == 6, "all events landed in delivered")
 
-    # Stale lease recovery: a crashed worker's claim returns to pending.
+    # Repeated rounds with more workers than events: a single passing round is
+    # not evidence for a race, so hammer the claim path. Each round asserts
+    # exactly-once independently.
+    ROUNDS, EVENTS, WORKERS = 12, 6, 8
+    worst = None
+    for rnd in range(ROUNDS):
+        calls.clear()
+        for n in range(EVENTS):
+            c_c.post(B + "/ideas", json={"title": f"Conc {rnd}-{n}",
+                                         "source_url": f"https://example.com/c{rnd}-{n}"})
+        threads = [threading.Thread(target=pa_c.drain_pending) for _ in range(WORKERS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if len(calls) != EVENTS or len(set(calls)) != EVENTS:
+            worst = (rnd, len(calls), sorted(x for x in set(calls) if calls.count(x) > 1))
+            break
+        left = c_c.get(B + "/review-events").json()["counts"]
+        if left["pending"] or left["processing"]:
+            worst = (rnd, "stranded", left)
+            break
+    ok(worst is None,
+       f"{EVENTS} events reviewed exactly once under {WORKERS} concurrent drains, "
+       f"{ROUNDS} rounds (first bad round: {worst})")
+    counts = c_c.get(B + "/review-events").json()["counts"]
+    ok(counts["pending"] == 0 and counts["processing"] == 0, "no events stranded after concurrent drains")
+    ok(counts["delivered"] == ROUNDS * EVENTS, "every event landed in delivered exactly once")
+
+    # --- claim exclusivity, directly ------------------------------------- #
     stranded = c_c.post(B + "/ideas", json={"title": "Stranded", "source_url": "https://example.com/st"}).json()
     s_ev = next(e for e in pa_c._iter_events(pa_c.EVENTS_PENDING) if e["idea_id"] == stranded["id"])
-    claimed = pa_c._claim_event(s_ev["event_id"])
+    s_id = s_ev["event_id"]
+    claimed = pa_c._claim_event(s_id)
     ok(claimed is not None, "event can be claimed")
-    ok(pa_c._claim_event(s_ev["event_id"]) is None, "a claimed event cannot be claimed twice")
-    ok(pa_c._reclaim_stale_leases(max_lease_seconds=-1) >= 1, "stale lease is reclaimed to pending")
+    ok(claimed.get("lease_at") and claimed.get("lease_owner"),
+       "the lease is stamped as part of the claim itself (no unstamped window)")
+    ok(pa_c._claim_event(s_id) is None, "a claimed event cannot be claimed twice")
+
+    # An existing processing destination must not be replaceable by a second
+    # claimant, even when a pending copy exists (the post-crash shape).
+    proc_path = pa_c.EVENTS_PROCESSING / f"{s_id}.json"
+    owner_before = json.loads(proc_path.read_text("utf-8"))["lease_owner"]
+    (pa_c.EVENTS_PENDING / f"{s_id}.json").write_text(proc_path.read_text("utf-8"), "utf-8")
+    ok(pa_c._claim_event(s_id) is None, "claim refused while a processing lease exists")
+    ok(json.loads(proc_path.read_text("utf-8"))["lease_owner"] == owner_before,
+       "an existing processing lease is never overwritten by another claimant")
+
+    # A live lease must NOT be resurrected by ordinary reclaim — this is the
+    # regression that made the concurrent test flaky.
+    ok(pa_c._reclaim_stale_leases() == 0, "ordinary reclaim never resurrects a live lease")
+    unstamped = dict(claimed)
+    unstamped.pop("lease_at", None)
+    proc_path.write_text(json.dumps(unstamped), "utf-8")
+    ok(pa_c._reclaim_stale_leases() == 0, "an unstamped lease is not treated as stale")
+    proc_path.write_text(json.dumps(claimed), "utf-8")
+
+    # Expired leases still recover, and the displaced owner loses write rights.
+    ok(pa_c._reclaim_stale_leases(max_lease_seconds=-1) >= 1, "expired lease is reclaimed to pending")
+    ok(pa_c._lease_is_mine(claimed) is False, "a reclaimed event's old owner cannot write results")
     pa_c.drain_pending()
     ok(_review_of(c_c, stranded["id"])["state"] == "needs_context", "reclaimed event is processed")
 
