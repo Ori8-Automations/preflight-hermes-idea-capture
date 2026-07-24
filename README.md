@@ -68,6 +68,22 @@ No dummy data: Preflight starts with an empty category tree, a set of sensible
 default statuses, a few generic starter templates, and a generic list of source
 types — all editable.
 
+## Planned v1.1 — Context review and intent capture
+
+The proposed next minor release adds an optional event-driven review flow for
+rough ideas and link-only captures. It is designed to summarize public source
+material, suggest classification, and ask the operator one concise follow-up
+when the reason for saving an item is missing.
+
+The proposal preserves Preflight's existing boundary: review may enrich an idea,
+but it may not automatically create projects, promote work to Kanban, archive or
+delete items, or dispatch agents. Idea capture also remains independent from
+review availability.
+
+See the [v1.1 context review and intent capture specification](docs/v1.1-context-review-and-intent-capture.md)
+for the event model, security boundary, notification budget, acceptance criteria,
+and implementation handoff.
+
 ## Requirements
 
 - A running Hermes Agent dashboard (FastAPI backend).
