@@ -55,6 +55,7 @@ CONFIG_FILE = DATA_ROOT / "categories.json"
 # this tree is ever required for capture to succeed.
 EVENTS_DIR = DATA_ROOT / "events"
 EVENTS_PENDING = EVENTS_DIR / "pending"
+EVENTS_PROCESSING = EVENTS_DIR / "processing"  # claimed-but-not-finished lease
 EVENTS_DELIVERED = EVENTS_DIR / "delivered"
 EVENTS_FAILED = EVENTS_DIR / "failed"
 
@@ -149,7 +150,14 @@ _DEFAULT_CONTEXT_REVIEW: Dict[str, Any] = {
     "followup_delivery": "none",  # none | preflight | telegram | api
     "digest_window_seconds": 900,
     "event_retention_days": 30,
+    # A correlation token is only answerable for this long after it is issued.
+    "intent_token_ttl_seconds": 1209600,  # 14 days
+    # Bounds for the public-source fetch path (see fetch_public_source).
+    "fetch_max_bytes": 1048576,  # 1 MiB
+    "fetch_timeout_seconds": 10,
+    "fetch_max_redirects": 5,
 }
+_FOLLOWUP_MODES = {"none", "preflight", "telegram", "api"}
 
 # Allowed enumerations for the review envelope. Anything outside these collapses
 # to a safe default rather than being persisted verbatim.
@@ -181,6 +189,19 @@ WEBHOOK_SECRET = os.environ.get("PREFLIGHT_REVIEW_WEBHOOK_SECRET", "").strip()
 # It is never given filesystem, shell, or credential access.
 _REVIEWER: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
 
+# Seams for the two network boundaries. Both default to real stdlib transports
+# but are overridable so the full path is exercised offline in tests. Neither is
+# ever reached unless context_review is enabled AND a route is configured.
+#   _http_post(url, body: bytes, headers: dict) -> (status:int, text:str)
+#   _http_open(url) -> (status:int, headers:dict, body:bytes, final_url:str)  (no redirects followed)
+_HTTP_POST: Optional[Callable[[str, bytes, Dict[str, str]], Tuple[int, str]]] = None
+_HTTP_OPEN: Optional[Callable[[str], Tuple[int, Dict[str, str], bytes, str]]] = None
+
+# Pluggable notification sink for follow-up questions / digests. None means
+# "store only" — the follow-up is recorded on the idea but nothing is pushed.
+#   _NOTIFIER(kind: str, payload: dict) -> None
+_NOTIFIER: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
 
 def set_reviewer(fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]) -> None:
     """Install (or clear) the review adapter used to process events.
@@ -191,6 +212,19 @@ def set_reviewer(fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]) -> No
     """
     global _REVIEWER
     _REVIEWER = fn
+
+
+def set_http_transport(post=None, opener=None) -> None:
+    """Override the HTTP POST (webhook) and single-hop opener (fetch) seams."""
+    global _HTTP_POST, _HTTP_OPEN
+    _HTTP_POST = post
+    _HTTP_OPEN = opener
+
+
+def set_notifier(fn: Optional[Callable[[str, Dict[str, Any]], None]]) -> None:
+    """Install (or clear) the follow-up/digest notification sink."""
+    global _NOTIFIER
+    _NOTIFIER = fn
 
 
 # --------------------------------------------------------------------------- #
@@ -230,16 +264,40 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _atomic_write(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
-    tmp.replace(path)
+    # Unique temp name so two concurrent writers to the same path can't clobber
+    # each other's half-written temp file before the atomic rename.
+    tmp = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)  # durable file bytes before the rename
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(path))  # atomic on POSIX
+        # Persist the directory entry too, so the rename survives a crash.
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass  # some platforms disallow directory fsync; rename is still atomic
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _ensure_layout() -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     IDEAS_DIR.mkdir(parents=True, exist_ok=True)
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    for d in (EVENTS_PENDING, EVENTS_DELIVERED, EVENTS_FAILED):
+    for d in (EVENTS_PENDING, EVENTS_PROCESSING, EVENTS_DELIVERED, EVENTS_FAILED):
         d.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         _atomic_write(
@@ -435,23 +493,48 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 # Operator-authored fields that define what a reviewer actually reviews. The
-# input revision hashes exactly these, so appending a review, a timeline note,
-# or bumping updated_at does NOT invalidate an in-flight event — but any operator
-# edit does, which is what makes a stale event detectable.
+# input revision hashes exactly these plus operator-authored timeline updates
+# (a note can carry the very context the reviewer needs), so adding real
+# operator context changes the revision and makes an in-flight event stale —
+# while appending a review or bumping updated_at does not.
 _REVISION_FIELDS = (
     "title", "summary", "notes_markdown",
     "source_url", "source_type", "category", "subcategory", "tags",
 )
+# Timeline authors whose entries count as operator-authored context. System and
+# reviewer entries are excluded so machine activity never shifts the revision.
+_OPERATOR_UPDATE_AUTHORS = {"me", "operator"}
+
+
+def _now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp (accepting a trailing Z) or return None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _input_revision(idea: Dict[str, Any]) -> str:
-    """Deterministic content hash of the operator-authored idea fields."""
+    """Deterministic content hash of the operator-authored idea state."""
     payload = {}
     for k in _REVISION_FIELDS:
         v = idea.get(k)
         if k == "tags":
             v = sorted(str(t) for t in (v or []))
         payload[k] = v
+    # Fold in operator-authored update bodies, in order — these can carry the
+    # missing "why" a reviewer is meant to pick up.
+    payload["operator_updates"] = [
+        str(u.get("body") or "")
+        for u in (idea.get("updates") or [])
+        if isinstance(u, dict) and str(u.get("by") or "") in _OPERATOR_UPDATE_AUTHORS
+    ]
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -484,10 +567,21 @@ def _sanitize_review(raw: Any) -> Optional[Dict[str, Any]]:
     token = intent.get("correlation_token")
     token = token if isinstance(token, str) and _TOKEN_RE.match(token) else None
 
+    try:
+        generation = int(raw.get("generation") or 1)
+    except (TypeError, ValueError):
+        generation = 1
+
     return {
         "state": _one_of(raw.get("state"), _REVIEW_STATES, "waiting"),
         "input_revision": _s(raw.get("input_revision"), 100) or None,
         "reviewer_version": _s(raw.get("reviewer_version"), 120) or None,
+        # Bumped by each manual "Review again" so a re-review is a distinct
+        # event even when the operator content is byte-identical.
+        "generation": max(1, min(generation, 10_000)),
+        # True while a re-review is in flight over an already-completed review.
+        # Cleared automatically when the replacement review lands.
+        "review_pending": bool(raw.get("review_pending")),
         "source": {
             "retrieval_status": _one_of(src.get("retrieval_status"), _RETRIEVAL_STATUSES, "not_needed"),
             "title": _s(src.get("title"), 300),
@@ -511,22 +605,34 @@ def _sanitize_review(raw: Any) -> Optional[Dict[str, Any]]:
             "question": _s(intent.get("question"), 1000),
             "correlation_token": token,
             "revision_bound": _s(intent.get("revision_bound"), 100) or None,
+            # Issuance/expiry make an unanswered token age out instead of
+            # remaining answerable forever (including across an import).
+            "token_issued_at": _s(intent.get("token_issued_at"), 40) or None,
+            "token_expires_at": _s(intent.get("token_expires_at"), 40) or None,
             "answer": _s(intent.get("answer"), 4000),
             "answered_at": _s(intent.get("answered_at"), 40) or None,
             "answered_via": _one_of(intent.get("answered_via"), _ANSWER_VIA, None),
         },
+        "followup": {
+            # Notification budget bookkeeping: at most one unanswered follow-up
+            # per idea revision/generation.
+            "sent_at": _s((raw.get("followup") or {}).get("sent_at"), 40) or None,
+            "channel": _one_of((raw.get("followup") or {}).get("channel"), _FOLLOWUP_MODES, None),
+            "digest_id": _s((raw.get("followup") or {}).get("digest_id"), 64) or None,
+        } if isinstance(raw.get("followup"), dict) else {"sent_at": None, "channel": None, "digest_id": None},
         "created_at": _s(raw.get("created_at"), 40) or None,
         "updated_at": _s(raw.get("updated_at"), 40) or None,
         "error_code": _s(raw.get("error_code"), 120) or None,
     }
 
 
-def _blank_review(input_revision: str) -> Dict[str, Any]:
+def _blank_review(input_revision: str, generation: int = 1) -> Dict[str, Any]:
     now = _now()
     return _sanitize_review({
         "state": "waiting",
         "input_revision": input_revision,
         "reviewer_version": REVIEWER_VERSION,
+        "generation": generation,
         "intent": {"status": "missing"},
         "created_at": now,
         "updated_at": now,
@@ -553,9 +659,15 @@ def _gen_correlation_token(taken: set) -> str:
     return "PF-" + uuid.uuid4().hex[:8].upper()
 
 
-def _pending_tokens() -> Dict[str, str]:
-    """Map correlation_token -> idea_id for every idea awaiting an answer."""
-    out: Dict[str, str] = {}
+def _token_index() -> Dict[str, List[str]]:
+    """Map correlation_token -> ALL idea ids awaiting an answer for that token.
+
+    Deliberately a list, not a scalar: an import can introduce two pending ideas
+    carrying the same token, and collapsing that to one silently would let an
+    answer land on an arbitrary idea. Callers must treat len() > 1 as ambiguous
+    and fail closed.
+    """
+    out: Dict[str, List[str]] = {}
     for path in IDEAS_DIR.glob("idea_*.json"):
         data = _read_json(path, None)
         if not isinstance(data, dict):
@@ -566,8 +678,33 @@ def _pending_tokens() -> Dict[str, str]:
         intent = review.get("intent") or {}
         tok = intent.get("correlation_token")
         if tok and intent.get("status") in ("requested", "missing"):
-            out[tok] = data.get("id")
+            out.setdefault(tok, []).append(data.get("id"))
     return out
+
+
+def _all_known_tokens() -> set:
+    """Every token currently recorded on any idea, pending or not.
+
+    Used when minting a new token so we never reuse one that still appears in
+    an answered/dismissed record — reuse would make history ambiguous.
+    """
+    seen = set()
+    for path in IDEAS_DIR.glob("idea_*.json"):
+        data = _read_json(path, None)
+        if not isinstance(data, dict):
+            continue
+        review = data.get("review")
+        if isinstance(review, dict):
+            tok = (review.get("intent") or {}).get("correlation_token")
+            if tok:
+                seen.add(tok)
+    return seen
+
+
+def _token_expired(intent: Dict[str, Any]) -> bool:
+    """True when the token's expiry has passed. Absent expiry never expires."""
+    exp = _parse_ts(intent.get("token_expires_at"))
+    return exp is not None and _now_dt() > exp
 
 
 # ---- SSRF-safe public source retrieval guard ------------------------------- #
@@ -640,13 +777,338 @@ def validate_public_url(url: str, *, resolve: bool = True) -> Tuple[bool, str]:
 
 
 def sign_payload(secret: str, body: bytes) -> str:
-    """Detached HMAC-SHA256 signature for webhook transport authentication."""
+    """Detached HMAC-SHA256 signature for webhook transport authentication.
+
+    An empty secret is a configuration error, not a valid key: signing with it
+    would produce a signature anyone could compute. Refuse rather than mint one.
+    """
+    if not secret:
+        raise ValueError("refusing to sign with an empty secret")
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return "sha256=" + digest
 
 
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
-    return hmac.compare_digest(sign_payload(secret, body), signature or "")
+    """Constant-time signature check. Fails closed on empty secret/signature."""
+    if not secret or not signature:
+        return False
+    try:
+        expected = sign_payload(secret, body)
+    except ValueError:
+        return False
+    return hmac.compare_digest(expected, signature)
+
+
+# ---- bounded public source retrieval --------------------------------------- #
+#
+# Fetched pages are DATA, never instructions. Nothing retrieved here is treated
+# as agent authority, and only a bounded summary plus retrieval metadata is ever
+# persisted — never the raw body.
+
+# Only text-ish documents are considered. Binary attachments are out of scope
+# for v1.1 and are refused rather than downloaded.
+_ALLOWED_CONTENT_PREFIXES = ("text/html", "text/plain", "application/xhtml", "application/json")
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1>", re.IGNORECASE | re.DOTALL)
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_WS_RE = re.compile(r"\s+")
+
+
+def _default_http_open(url: str) -> Tuple[int, Dict[str, str], bytes, str]:
+    """Single HTTP(S) hop with NO redirect following (the caller re-validates).
+
+    Imported lazily so the module has no import-time network dependency.
+    """
+    import urllib.request  # noqa: PLC0415 — deliberately lazy
+
+    cfg = _review_config()
+    timeout = int(cfg.get("fetch_timeout_seconds", 10) or 10)
+    max_bytes = int(cfg.get("fetch_max_bytes", 1048576) or 1048576)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None  # surface the redirect to the caller instead
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Preflight-ContextReview/1 (+bounded public fetch)",
+                 "Accept": "text/html,text/plain;q=0.9,*/*;q=0.1"},
+        method="GET",
+    )
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            # Read one byte past the cap so an oversize body is detectable.
+            body = resp.read(max_bytes + 1)
+            return resp.status, headers, body, resp.url
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "code", 0) or 0
+        headers = {}
+        hdrs = getattr(exc, "headers", None)
+        if hdrs:
+            headers = {k.lower(): v for k, v in hdrs.items()}
+        if status:  # an HTTP error response (incl. 3xx surfaced by _NoRedirect)
+            return status, headers, b"", url
+        raise
+
+
+def _extract_text(body: bytes, content_type: str) -> Tuple[str, str]:
+    """Return (title, plain_text) from a bounded response body.
+
+    Tags are stripped; script/style contents are dropped entirely. This is a
+    deliberately dumb extractor — its output is treated as untrusted text.
+    """
+    try:
+        text = body.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return "", ""
+    title = ""
+    if "html" in content_type:
+        m = _TITLE_RE.search(text)
+        if m:
+            title = _WS_RE.sub(" ", _TAG_RE.sub("", m.group(1))).strip()[:300]
+        text = _SCRIPT_STYLE_RE.sub(" ", text)
+        text = _TAG_RE.sub(" ", text)
+    return title, _WS_RE.sub(" ", text).strip()
+
+
+def fetch_public_source(url: str, *, resolve: bool = True) -> Dict[str, Any]:
+    """Fetch a public source under strict bounds. Never raises for a bad source.
+
+    Returns ``{retrieval_status, title, text, final_url, reason}`` where
+    ``retrieval_status`` is one of ``ok`` / ``blocked`` / ``failed``. Inability to
+    retrieve is an ordinary outcome, not a capture failure.
+
+    Enforced on the initial request AND on every redirect hop:
+      - absolute http(s) only;
+      - SSRF re-validation of each hop's destination (never trust the first);
+      - redirect-count, response-size, and time limits;
+      - text-only content types (no binary downloads);
+      - only a bounded summary is returned — the raw body is discarded.
+    """
+    cfg = _review_config()
+    max_redirects = int(cfg.get("fetch_max_redirects", 5) or 5)
+    max_bytes = int(cfg.get("fetch_max_bytes", 1048576) or 1048576)
+    opener = _HTTP_OPEN or _default_http_open
+
+    current = (url or "").strip()
+    seen = set()
+    for _ in range(max_redirects + 1):
+        okay, reason = validate_public_url(current, resolve=resolve)
+        if not okay:
+            return {"retrieval_status": "blocked", "title": "", "text": "",
+                    "final_url": current, "reason": reason}
+        if current in seen:
+            return {"retrieval_status": "failed", "title": "", "text": "",
+                    "final_url": current, "reason": "redirect loop"}
+        seen.add(current)
+
+        try:
+            status, headers, body, final_url = opener(current)
+        except Exception as exc:  # noqa: BLE001 — network failure is ordinary
+            return {"retrieval_status": "failed", "title": "", "text": "",
+                    "final_url": current, "reason": f"fetch error: {type(exc).__name__}"}
+
+        # Redirect: re-validate the next hop from the top of this loop.
+        if status in (301, 302, 303, 307, 308):
+            location = headers.get("location", "")
+            if not location:
+                return {"retrieval_status": "failed", "title": "", "text": "",
+                        "final_url": current, "reason": "redirect without location"}
+            # Relative locations resolve against the current URL.
+            from urllib.parse import urljoin  # noqa: PLC0415
+            current = urljoin(current, location)
+            continue
+
+        if status != 200:
+            return {"retrieval_status": "failed", "title": "", "text": "",
+                    "final_url": final_url or current, "reason": f"http {status}"}
+
+        content_type = (headers.get("content-type") or "").split(";")[0].strip().lower()
+        if content_type and not content_type.startswith(_ALLOWED_CONTENT_PREFIXES):
+            return {"retrieval_status": "blocked", "title": "", "text": "",
+                    "final_url": final_url or current,
+                    "reason": f"unsupported content type {content_type}"}
+
+        declared = headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > max_bytes:
+            return {"retrieval_status": "blocked", "title": "", "text": "",
+                    "final_url": final_url or current, "reason": "content-length over limit"}
+        if len(body) > max_bytes:
+            return {"retrieval_status": "blocked", "title": "", "text": "",
+                    "final_url": final_url or current, "reason": "response over size limit"}
+
+        title, text = _extract_text(body, content_type)
+        return {"retrieval_status": "ok", "title": title, "text": text[:20000],
+                "final_url": final_url or current, "reason": "ok"}
+
+    return {"retrieval_status": "failed", "title": "", "text": "",
+            "final_url": current, "reason": "too many redirects"}
+
+
+# ---- webhook delivery ------------------------------------------------------ #
+
+
+def _webhook_target() -> Tuple[str, str]:
+    """(url, secret) for live delivery, or ("", "") when not fully configured."""
+    if not WEBHOOK_URL or not WEBHOOK_SECRET:
+        return "", ""
+    return WEBHOOK_URL, WEBHOOK_SECRET
+
+
+def deliver_event_webhook(event: Dict[str, Any]) -> Tuple[bool, str]:
+    """POST one minimal event to the configured reviewer, HMAC-signed.
+
+    Returns (ok, detail). The payload carries no idea body and no fetched source
+    content — the reviewer retrieves the canonical record by validated idea id.
+    Refuses to send at all unless a URL *and* a non-empty secret are configured
+    and the destination passes the same SSRF validation as source retrieval.
+    """
+    url, secret = _webhook_target()
+    if not url:
+        return False, "webhook not configured"
+    okay, reason = validate_public_url(url, resolve=(_HTTP_POST is None))
+    if not okay:
+        return False, f"webhook url rejected: {reason}"
+
+    payload = {
+        "schema_version": event.get("schema_version", 1),
+        "event_id": event.get("event_id"),
+        "event_type": event.get("event_type"),
+        "idea_id": event.get("idea_id"),
+        "idea_revision": event.get("idea_revision"),
+        "created_at": event.get("created_at"),
+    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        signature = sign_payload(secret, body)
+    except ValueError as exc:
+        return False, str(exc)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Preflight-Signature": signature,
+        "X-Preflight-Event-Id": str(event.get("event_id") or ""),
+        # Deterministic key so the receiver can dedupe replays itself.
+        "X-Preflight-Idempotency-Key": str(event.get("idempotency_key") or ""),
+    }
+    poster = _HTTP_POST or _default_http_post
+    try:
+        status, text = poster(url, body, headers)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"delivery error: {type(exc).__name__}"
+    if 200 <= status < 300:
+        return True, "delivered"
+    return False, f"http {status}: {(text or '')[:200]}"
+
+
+def _default_http_post(url: str, body: bytes, headers: Dict[str, str]) -> Tuple[int, str]:
+    import urllib.request  # noqa: PLC0415 — deliberately lazy
+
+    timeout = int(_review_config().get("fetch_timeout_seconds", 10) or 10)
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(4096).decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "code", 0) or 0
+        if status:
+            return status, ""
+        raise
+
+
+# ---- follow-up notifications ---------------------------------------------- #
+
+
+def _notify(kind: str, payload: Dict[str, Any]) -> bool:
+    """Hand a follow-up/digest to the configured sink. False when store-only."""
+    mode = _review_config().get("followup_delivery", "none")
+    if mode == "none" or _NOTIFIER is None:
+        return False
+    try:
+        _NOTIFIER(kind, dict(payload))
+        return True
+    except Exception:  # noqa: BLE001 — a failed notification never breaks review
+        return False
+
+
+def send_due_followups() -> Dict[str, Any]:
+    """Deliver pending follow-ups, grouping close-together ones into a digest.
+
+    Notification budget, enforced here:
+      - nothing is sent when intent is already present;
+      - at most ONE unanswered follow-up per idea revision/generation
+        (``followup.sent_at`` is the guard);
+      - captures whose follow-ups fall inside ``digest_window_seconds`` of each
+        other are grouped into a single digest message instead of N alerts.
+    """
+    cfg = _review_config()
+    if not cfg.get("enabled") or cfg.get("followup_delivery", "none") == "none":
+        return {"sent": 0, "digest": False, "skipped": "delivery disabled"}
+
+    window = int(cfg.get("digest_window_seconds", 900) or 900)
+    due: List[Dict[str, Any]] = []
+    with _LOCK:
+        for path in sorted(IDEAS_DIR.glob("idea_*.json")):
+            idea = _read_json(path, None)
+            if not isinstance(idea, dict):
+                continue
+            review = idea.get("review")
+            if not isinstance(review, dict):
+                continue
+            intent = review.get("intent") or {}
+            followup = review.get("followup") or {}
+            if intent.get("status") != "requested":
+                continue          # present / answered / dismissed → no message
+            if followup.get("sent_at"):
+                continue          # already sent one for this generation
+            if _token_expired(intent):
+                continue
+            due.append(idea)
+
+    if not due:
+        return {"sent": 0, "digest": False}
+
+    # Group by review timestamp proximity to decide digest vs single message.
+    stamps = [_parse_ts((i.get("review") or {}).get("updated_at")) for i in due]
+    stamps = [s for s in stamps if s]
+    span = (max(stamps) - min(stamps)).total_seconds() if len(stamps) > 1 else 0
+    as_digest = len(due) > 1 and span <= window
+
+    channel = cfg.get("followup_delivery", "none")
+    digest_id = "dg_" + uuid.uuid4().hex[:12] if as_digest else None
+    items = [
+        {
+            "idea_id": i["id"],
+            "title": i.get("title", ""),
+            "token": ((i.get("review") or {}).get("intent") or {}).get("correlation_token"),
+            "question": ((i.get("review") or {}).get("intent") or {}).get("question"),
+            "source_title": ((i.get("review") or {}).get("source") or {}).get("title"),
+        }
+        for i in due
+    ]
+    ok = _notify("digest" if as_digest else "followup",
+                 {"items": items, "digest_id": digest_id})
+
+    if not ok:
+        return {"sent": 0, "digest": as_digest, "skipped": "no sink"}
+
+    now = _now()
+    for idea_stub in due:
+        with _LOCK:
+            idea = _read_json(_idea_path(idea_stub["id"]), None)
+            if not isinstance(idea, dict):
+                continue
+            review = idea.get("review")
+            if not isinstance(review, dict):
+                continue
+            review["followup"] = {"sent_at": now, "channel": channel, "digest_id": digest_id}
+            review["state"] = "followup_sent"
+            review["updated_at"] = now
+            idea["review"] = _sanitize_review(review)
+            _atomic_write(_idea_path(idea["id"]), idea)
+    return {"sent": len(due), "digest": as_digest, "digest_id": digest_id}
 
 
 # ---- durable outbox -------------------------------------------------------- #
@@ -670,20 +1132,29 @@ def _iter_events(dirpath: Path) -> List[Dict[str, Any]]:
 
 
 def _find_event_by_idempotency(key: str) -> Optional[Dict[str, Any]]:
-    """An event with this idempotency key that is pending or already delivered.
+    """An event with this idempotency key that is live or already delivered.
 
     Failed events are ignored so a caller can legitimately retry after failure,
-    but a live/succeeded event blocks duplicate enqueues and duplicate reviews.
+    but a pending/in-flight/succeeded event blocks duplicate enqueues and
+    duplicate reviews.
     """
-    for d in (EVENTS_PENDING, EVENTS_DELIVERED):
+    for d in (EVENTS_PENDING, EVENTS_PROCESSING, EVENTS_DELIVERED):
         for ev in _iter_events(d):
             if ev.get("idempotency_key") == key:
                 return ev
     return None
 
 
-def _enqueue_event(idea: Dict[str, Any], event_type: str = "idea.created") -> Optional[Dict[str, Any]]:
-    """Write a review event to the outbox. Idempotent per (type, id, revision).
+def _enqueue_event(
+    idea: Dict[str, Any],
+    event_type: str = "idea.created",
+    generation: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """Write a review event to the outbox.
+
+    Idempotent per (type, idea id, input revision, generation). ``generation`` is
+    what lets a deliberate "Review again" enqueue real work for byte-identical
+    content, while an accidental double-submit still dedupes.
 
     Returns the event (existing or newly written), or None when context review
     is disabled. Callers treat a None/raise here as non-fatal: capture must
@@ -692,18 +1163,24 @@ def _enqueue_event(idea: Dict[str, Any], event_type: str = "idea.created") -> Op
     if not _review_config().get("enabled"):
         return None
     rev = _input_revision(idea)
-    idem = f"{event_type}:{idea['id']}:{rev}"
+    idem = f"{event_type}:{idea['id']}:{rev}:g{generation}"
     existing = _find_event_by_idempotency(idem)
     if existing is not None:
         return existing
+    now = _now()
+    grace = int(_review_config().get("grace_period_seconds", 600) or 0)
     event = {
         "schema_version": 1,
         "event_id": "evt_" + uuid.uuid4().hex[:16],
         "event_type": event_type,
         "idea_id": idea["id"],
         "idea_revision": rev,
+        "generation": generation,
         "idempotency_key": idem,
-        "created_at": _now(),
+        "created_at": now,
+        # Reviewing waits out the grace period so a capture the operator is still
+        # editing isn't reviewed mid-thought.
+        "not_before": (_now_dt() + timedelta(seconds=grace)).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "attempts": 0,
         "last_attempt_at": None,
         "last_error": None,
@@ -714,10 +1191,59 @@ def _enqueue_event(idea: Dict[str, Any], event_type: str = "idea.created") -> Op
 
 
 def _move_event(event: Dict[str, Any], dest: Path) -> None:
-    src = _event_path(EVENTS_PENDING, event["event_id"])
+    """Write the event into ``dest`` and drop it from every other queue dir."""
     _atomic_write(_event_path(dest, event["event_id"]), event)
-    if dest != EVENTS_PENDING and src.exists():
-        src.unlink()
+    for d in (EVENTS_PENDING, EVENTS_PROCESSING, EVENTS_DELIVERED, EVENTS_FAILED):
+        if d == dest:
+            continue
+        stale = _event_path(d, event["event_id"])
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+
+def _event_is_due(event: Dict[str, Any]) -> bool:
+    """False while the event is still inside its grace period."""
+    not_before = _parse_ts(event.get("not_before"))
+    return not_before is None or _now_dt() >= not_before
+
+
+def _claim_event(event_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically claim a pending event by moving it to ``processing``.
+
+    ``os.rename`` is the claim: exactly one caller can move a given path, so two
+    concurrent drains cannot both take the same event. Returns the claimed event
+    or None if another worker got there first.
+    """
+    src = _event_path(EVENTS_PENDING, event_id)
+    dst = _event_path(EVENTS_PROCESSING, event_id)
+    EVENTS_PROCESSING.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(str(src), str(dst))
+    except OSError:
+        return None  # already claimed, or gone
+    ev = _read_json(dst, None)
+    if not isinstance(ev, dict):
+        return None
+    ev["status"] = "processing"
+    ev["lease_at"] = _now()
+    _atomic_write(dst, ev)
+    return ev
+
+
+def _reclaim_stale_leases(max_lease_seconds: int = 900) -> int:
+    """Return events abandoned mid-processing (crashed worker) to ``pending``."""
+    recovered = 0
+    for ev in _iter_events(EVENTS_PROCESSING):
+        leased = _parse_ts(ev.get("lease_at"))
+        if leased is None or (_now_dt() - leased).total_seconds() > max_lease_seconds:
+            ev["status"] = "pending"
+            ev["last_error"] = "recovered from stale lease"
+            _move_event(ev, EVENTS_PENDING)
+            recovered += 1
+    return recovered
 
 
 def _public_event(ev: Dict[str, Any]) -> Dict[str, Any]:
@@ -728,9 +1254,12 @@ def _public_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "event_type": ev.get("event_type"),
         "idea_id": ev.get("idea_id"),
         "idea_revision": ev.get("idea_revision"),
+        "generation": ev.get("generation", 1),
         "status": ev.get("status"),
         "attempts": ev.get("attempts", 0),
         "created_at": ev.get("created_at"),
+        "not_before": ev.get("not_before"),
+        "due": _event_is_due(ev),
         "last_attempt_at": ev.get("last_attempt_at"),
         "last_error": ev.get("last_error"),
     }
@@ -752,7 +1281,13 @@ def _apply_review(idea_id: str, review: Dict[str, Any], timeline_note: Optional[
                 live_rev = _input_revision(idea)
                 if review["input_revision"] != live_rev:
                     raise HTTPException(status_code=409, detail="stale review revision")
+        # Same revision: only a newer generation may replace the existing review,
+        # so a late duplicate of an old generation can't undo a fresh re-review.
+        if current and current.get("input_revision") == review.get("input_revision"):
+            if int(review.get("generation") or 1) < int(current.get("generation") or 1):
+                raise HTTPException(status_code=409, detail="stale review generation")
         review = _sanitize_review(review)
+        review["review_pending"] = False  # a landed review clears the in-flight flag
         review["updated_at"] = _now()
         idea["review"] = review
         idea["updated_at"] = review["updated_at"]
@@ -764,16 +1299,44 @@ def _apply_review(idea_id: str, review: Dict[str, Any], timeline_note: Optional[
     return idea
 
 
-def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Run the installed reviewer for one event and persist the result.
+def _retry_or_fail(event: Dict[str, Any], error: str, max_attempts: int) -> Dict[str, Any]:
+    """Send an event back to pending, or to failed once retries are exhausted."""
+    event["last_error"] = error
+    if int(event.get("attempts", 0)) >= max_attempts:
+        event["status"] = "failed"
+        with _LOCK:
+            _move_event(event, EVENTS_FAILED)
+    else:
+        event["status"] = "pending"
+        with _LOCK:
+            _move_event(event, EVENTS_PENDING)
+    return event
 
-    Idempotent and revision-guarded. Never mutates operator-authored fields.
-    Retrieval/model failure yields a bounded ``failed`` review state, not a lost
-    idea. Returns the (possibly updated) event.
+
+def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Run review for one event and persist the result.
+
+    Idempotent, grace-gated, and revision-guarded. Never mutates
+    operator-authored fields. Retrieval/model/transport failure yields a bounded
+    review state and a bounded retry — never a lost idea. Returns the event.
+
+    Order of work: webhook delivery (if configured) hands the event to an
+    external reviewer; an in-process ``_REVIEWER`` is the local alternative. Both
+    are optional, and every no-route case is bounded by ``max_delivery_attempts``
+    instead of retrying forever.
     """
     cfg = _review_config()
     max_attempts = int(cfg.get("max_delivery_attempts", 5) or 5)
     event = dict(event)
+
+    # Grace period: not yet due → return it to pending untouched (no attempt
+    # burned, so a premature drain can't exhaust the retry budget).
+    if not _event_is_due(event):
+        event["status"] = "pending"
+        with _LOCK:
+            _move_event(event, EVENTS_PENDING)
+        return event
+
     event["attempts"] = int(event.get("attempts", 0)) + 1
     event["last_attempt_at"] = _now()
 
@@ -793,35 +1356,45 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
             _move_event(event, EVENTS_FAILED)
         return event
 
+    # --- external reviewer via authenticated webhook ---------------------- #
+    webhook_url, _ = _webhook_target()
+    if webhook_url:
+        ok, detail = deliver_event_webhook(event)
+        if ok:
+            # The external reviewer will post results back through the normal
+            # review API; the event's job ends at successful hand-off.
+            event["status"] = "delivered"
+            event["last_error"] = None
+            with _LOCK:
+                _move_event(event, EVENTS_DELIVERED)
+            return event
+        if _REVIEWER is None:
+            return _retry_or_fail(event, f"webhook: {detail}", max_attempts)
+        # Fall through to the local reviewer when one is installed.
+
     if _REVIEWER is None:
-        # Nothing to deliver to yet; leave the event pending for a future drain.
-        event["status"] = "pending"
-        event["last_error"] = "no reviewer configured"
-        with _LOCK:
-            _move_event(event, EVENTS_PENDING)
-        return event
+        # No route at all. Bounded, not forever: this counts as an attempt and
+        # ends in `failed` once the budget is spent.
+        return _retry_or_fail(event, "no reviewer configured", max_attempts)
 
     try:
         result = _REVIEWER(_idea_for_output(idea)) or {}
     except Exception as exc:  # noqa: BLE001 — bound any adapter failure
-        review = _blank_review(event["idea_revision"])
+        review = _blank_review(event["idea_revision"], int(event.get("generation", 1)))
         review["state"] = "failed"
         review["error_code"] = "reviewer_error"
-        _apply_review(event["idea_id"], review, "Review failed; idea preserved.")
-        if event["attempts"] >= max_attempts:
-            event["status"] = "failed"
-            event["last_error"] = f"reviewer error: {type(exc).__name__}"
-            with _LOCK:
-                _move_event(event, EVENTS_FAILED)
-        else:
-            event["status"] = "pending"
-            event["last_error"] = f"reviewer error: {type(exc).__name__}"
-            with _LOCK:
-                _move_event(event, EVENTS_PENDING)
-        return event
+        try:
+            _apply_review(event["idea_id"], review, "Review failed; idea preserved.")
+        except HTTPException:
+            pass  # a newer review already exists; leave it alone
+        return _retry_or_fail(event, f"reviewer error: {type(exc).__name__}", max_attempts)
 
-    review = _build_review_from_result(idea, event["idea_revision"], result)
-    _apply_review(event["idea_id"], review, "Context review completed.")
+    review = _build_review_from_result(idea, event["idea_revision"], result,
+                                       int(event.get("generation", 1)))
+    try:
+        _apply_review(event["idea_id"], review, "Context review completed.")
+    except HTTPException as exc:
+        return _retry_or_fail(event, f"apply rejected: {exc.detail}", max_attempts)
     event["status"] = "delivered"
     event["last_error"] = None
     with _LOCK:
@@ -829,13 +1402,18 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
-def _build_review_from_result(idea: Dict[str, Any], revision: str, result: Dict[str, Any]) -> Dict[str, Any]:
+def _build_review_from_result(
+    idea: Dict[str, Any],
+    revision: str,
+    result: Dict[str, Any],
+    generation: int = 1,
+) -> Dict[str, Any]:
     """Fold a reviewer result into a full envelope, deciding intent + state.
 
     Source facts, agent suggestions, and operator intent are kept in separate
     sub-objects. A suggested classification is NEVER treated as operator intent.
     """
-    review = _blank_review(revision)
+    review = _blank_review(revision, generation)
     review["source"] = _sanitize_review({"source": result.get("source", {})})["source"]
     review["classification"] = _sanitize_review(
         {"classification": result.get("classification", {})}
@@ -847,11 +1425,13 @@ def _build_review_from_result(idea: Dict[str, Any], revision: str, result: Dict[
         review["intent"]["status"] = "present"
         review["state"] = "reviewed"
     else:
-        # Ask exactly one concise follow-up, correlated by token bound to this
-        # revision. The follow-up is only "sent" if delivery is configured;
-        # otherwise it waits as needs_context.
+        # Ask exactly one concise follow-up, correlated by a token bound to this
+        # revision and generation, with an explicit expiry. The follow-up is only
+        # pushed if delivery is configured; otherwise it waits as needs_context.
+        ttl = int(_review_config().get("intent_token_ttl_seconds", 1209600) or 1209600)
+        issued = _now_dt()
         with _LOCK:
-            token = _gen_correlation_token(set(_pending_tokens().keys()))
+            token = _gen_correlation_token(_all_known_tokens())
         review["intent"]["status"] = "requested"
         review["intent"]["question"] = str(
             intent.get("question")
@@ -860,21 +1440,33 @@ def _build_review_from_result(idea: Dict[str, Any], revision: str, result: Dict[
         )[:1000]
         review["intent"]["correlation_token"] = token
         review["intent"]["revision_bound"] = revision
+        review["intent"]["token_issued_at"] = issued.isoformat(timespec="seconds").replace("+00:00", "Z")
+        review["intent"]["token_expires_at"] = (
+            (issued + timedelta(seconds=ttl)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
         review["state"] = "needs_context"
     return review
 
 
 def drain_pending(limit: int = 100) -> List[Dict[str, Any]]:
-    """Process up to ``limit`` pending events. Returns the processed events.
+    """Claim and process up to ``limit`` due pending events.
 
-    Safe to call repeatedly; each call is idempotent per event because a
-    delivered event is moved out of ``pending``.
+    Each event is claimed by an atomic rename into ``processing`` before it is
+    worked, so concurrent drains never double-process one event. Events still
+    inside their grace period are left alone. Retention is pruned on the way out.
     """
+    _reclaim_stale_leases()
     processed: List[Dict[str, Any]] = []
     with _LOCK:
-        pending = _iter_events(EVENTS_PENDING)[:limit]
-    for ev in pending:
-        processed.append(process_event(ev))
+        candidates = [
+            ev for ev in _iter_events(EVENTS_PENDING) if _event_is_due(ev)
+        ][:limit]
+    for ev in candidates:
+        claimed = _claim_event(ev["event_id"])
+        if claimed is None:
+            continue  # another worker took it
+        processed.append(process_event(claimed))
+    _prune_events()
     return processed
 
 
@@ -883,14 +1475,19 @@ def _prune_events() -> None:
     days = int(_review_config().get("event_retention_days", 30) or 30)
     if days <= 0:
         return
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cutoff = (_now_dt() - timedelta(days=days)).isoformat(timespec="seconds").replace("+00:00", "Z")
     for d in (EVENTS_DELIVERED, EVENTS_FAILED):
+        if not d.exists():
+            continue
         for path in d.glob("evt_*.json"):
             ev = _read_json(path, None)
             if isinstance(ev, dict):
                 stamp = ev.get("last_attempt_at") or ev.get("created_at") or ""
                 if stamp and stamp < cutoff:
-                    path.unlink()
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -989,6 +1586,10 @@ class ContextReviewPatch(BaseModel):
     followup_delivery: Optional[str] = None
     digest_window_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
     event_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    intent_token_ttl_seconds: Optional[int] = Field(default=None, ge=60, le=31536000)
+    fetch_max_bytes: Optional[int] = Field(default=None, ge=1024, le=33554432)
+    fetch_timeout_seconds: Optional[int] = Field(default=None, ge=1, le=120)
+    fetch_max_redirects: Optional[int] = Field(default=None, ge=0, le=20)
 
 
 # --------------------------------------------------------------------------- #
@@ -1401,7 +2002,7 @@ async def update_context_review(body: ContextReviewPatch) -> Dict[str, Any]:
         for key, val in changes.items():
             if val is None:
                 continue
-            if key == "followup_delivery" and val not in ("none", "preflight", "telegram", "api"):
+            if key == "followup_delivery" and val not in _FOLLOWUP_MODES:
                 continue
             cr[key] = val
         cfg["context_review"] = cr
@@ -1415,15 +2016,44 @@ async def list_review_events() -> Dict[str, Any]:
     with _LOCK:
         _ensure_layout()
         pending = [_public_event(e) for e in _iter_events(EVENTS_PENDING)]
+        processing = [_public_event(e) for e in _iter_events(EVENTS_PROCESSING)]
         delivered = [_public_event(e) for e in _iter_events(EVENTS_DELIVERED)]
         failed = [_public_event(e) for e in _iter_events(EVENTS_FAILED)]
     return {
         "enabled": bool(_review_config().get("enabled")),
+        "webhook_configured": bool(_webhook_target()[0]),
         "pending": pending,
+        "processing": processing,
         "delivered": delivered,
         "failed": failed,
-        "counts": {"pending": len(pending), "delivered": len(delivered), "failed": len(failed)},
+        "counts": {
+            "pending": len(pending),
+            "processing": len(processing),
+            "delivered": len(delivered),
+            "failed": len(failed),
+        },
     }
+
+
+@router.post("/review-events/drain")
+async def drain_review_events(limit: int = 100) -> Dict[str, Any]:
+    """Process due events now (grace-gated, lease-claimed) and prune retention.
+
+    Exposed so an operator or a scheduler can drive the outbox; there is no
+    hidden background thread. Returns what was actually processed.
+    """
+    if not _review_config().get("enabled"):
+        raise HTTPException(status_code=409, detail="context review is disabled")
+    processed = drain_pending(max(1, min(int(limit), 1000)))
+    return {"processed": [_public_event(e) for e in processed], "count": len(processed)}
+
+
+@router.post("/review-events/send-followups")
+async def send_followups() -> Dict[str, Any]:
+    """Deliver due follow-ups, batching close-together ones into a digest."""
+    if not _review_config().get("enabled"):
+        raise HTTPException(status_code=409, detail="context review is disabled")
+    return send_due_followups()
 
 
 @router.get("/ideas/{idea_id}/review")
@@ -1438,36 +2068,44 @@ async def get_review(idea_id: str) -> Dict[str, Any]:
 async def enqueue_review(idea_id: str) -> Dict[str, Any]:
     """Enqueue (or re-enqueue) review for the idea's current input revision.
 
-    ``Review again`` binds a fresh event to the current revision. Returns 409
-    when context review is disabled — the feature must be enabled first.
+    ``Review again`` always produces real work: it bumps the review *generation*
+    so the new event is distinct even when the operator content is byte-identical
+    to a previously reviewed revision.
+
+    The last completed review is NOT erased. It stays visible (with
+    ``review_pending`` marking that a refresh is in flight) until a replacement
+    review actually lands, so a re-review can never leave the idea with less
+    information than it had. Returns 409 when context review is disabled.
     """
     with _LOCK:
         _ensure_layout()
         if not _review_config().get("enabled"):
             raise HTTPException(status_code=409, detail="context review is disabled")
         idea = _load_idea(idea_id)
-        event = _enqueue_event(idea, "idea.created")
-        # Reset the visible review state to waiting for the current revision,
-        # without disturbing any answer already recorded for that revision.
+        existing = idea.get("review") if isinstance(idea.get("review"), dict) else None
+        next_gen = int((existing or {}).get("generation") or 0) + 1
+
+        event = _enqueue_event(idea, "idea.created", generation=next_gen)
         if event is not None:
-            rev = event["idea_revision"]
-            existing = idea.get("review") if isinstance(idea.get("review"), dict) else None
-            if not (existing and existing.get("input_revision") == rev
-                    and (existing.get("intent") or {}).get("status") == "answered"):
-                idea["review"] = _blank_review(rev)
-                idea["updated_at"] = _now()
-                _atomic_write(_idea_path(idea_id), idea)
+            if existing:
+                # Preserve the completed review; just flag the in-flight refresh.
+                existing["review_pending"] = True
+                idea["review"] = _sanitize_review(existing)
+            else:
+                idea["review"] = _blank_review(event["idea_revision"], next_gen)
+            idea["updated_at"] = _now()
+            _atomic_write(_idea_path(idea_id), idea)
     return {"idea_id": idea_id, "event": _public_event(event) if event else None,
-            "review": _sanitize_review(idea.get("review"))}
+            "review": idea.get("review")}
 
 
 @router.post("/ideas/{idea_id}/intent-answer")
 async def answer_intent(idea_id: str, body: IntentAnswerIn) -> Dict[str, Any]:
     """Append an operator's intent answer, bound to a valid correlation token.
 
-    Fails closed on expired / used / mismatched / ambiguous tokens. Replaying
-    the same answer is idempotent. A reply to an older revision cannot overwrite
-    a newer intent answer.
+    Fails closed on malformed, expired, used, mismatched, and ambiguous tokens.
+    Replaying the same answer is idempotent. A reply bound to an older revision
+    cannot overwrite newer content.
     """
     token = body.token.strip().upper()
     if not _TOKEN_RE.match(token):
@@ -1481,19 +2119,32 @@ async def answer_intent(idea_id: str, body: IntentAnswerIn) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail="no review to answer")
         intent = review.get("intent") or {}
 
-        # Server-side resolution: the token must resolve to THIS idea, and this
-        # idea must actually be awaiting an answer for it.
-        resolved = _pending_tokens().get(token)
         if intent.get("correlation_token") != token:
             raise HTTPException(status_code=409, detail="token does not match this idea")
-        if resolved != idea_id and intent.get("status") != "answered":
-            raise HTTPException(status_code=409, detail="token not pending for this idea")
 
         # Idempotent replay: same token + same answer already recorded → no-op.
+        # Checked before pending-resolution because an answered token is no
+        # longer pending by definition.
         if intent.get("status") == "answered":
             if (intent.get("answer") or "") == body.answer.strip():
                 return {"idea_id": idea_id, "review": _sanitize_review(review), "idempotent": True}
             raise HTTPException(status_code=409, detail="intent already answered")
+
+        # Server-side resolution with explicit zero/one/many handling. An import
+        # can introduce two pending ideas carrying the same token; answering
+        # either would be a guess, so refuse rather than pick one.
+        matches = _token_index().get(token, [])
+        if len(matches) > 1:
+            raise HTTPException(status_code=409, detail="ambiguous correlation token")
+        if len(matches) == 0:
+            raise HTTPException(status_code=409, detail="token not pending")
+        if matches[0] != idea_id:
+            raise HTTPException(status_code=409, detail="token not pending for this idea")
+
+        # Expiry: an unanswered token ages out rather than staying answerable
+        # forever (notably across an export/import round trip).
+        if _token_expired(intent):
+            raise HTTPException(status_code=409, detail="correlation token expired")
 
         # A reply must target the revision the token was bound to; if the idea
         # moved on, fail closed rather than attach intent to stale content.
@@ -1512,9 +2163,11 @@ async def answer_intent(idea_id: str, body: IntentAnswerIn) -> Dict[str, Any]:
         idea["review"] = _sanitize_review(review)
         idea["updated_at"] = now
         # Recorded as operator-provided intent — it never replaces the original
-        # notes, and it is clearly attributed to the operator.
+        # notes. Attributed to "intent" rather than "operator" so that capturing
+        # the answer (already authoritative in the envelope) does not itself
+        # shift the input revision and invalidate the review that asked for it.
         idea.setdefault("updates", []).append(
-            {"at": now, "by": "operator", "body": f"Intent captured ({token}): {intent['answer']}"[:10000]}
+            {"at": now, "by": "intent", "body": f"Intent captured ({token}): {intent['answer']}"[:10000]}
         )
         _atomic_write(_idea_path(idea_id), idea)
     return {"idea_id": idea_id, "review": _sanitize_review(idea["review"]), "idempotent": False}
@@ -1699,6 +2352,9 @@ async def import_all(body: ImportIn) -> Dict[str, Any]:
                     "statuses": inc.get("statuses", []),
                     "templates": inc.get("templates", cfg.get("templates", [])),
                     "source_types": inc.get("source_types", cfg.get("source_types", _clone(_DEFAULT_SOURCE_TYPES))),
+                    # Settings are part of the bundle: a replace-import must not
+                    # silently drop the operator's review configuration.
+                    "context_review": inc.get("context_review", cfg.get("context_review", _clone(_DEFAULT_CONTEXT_REVIEW))),
                 }
             else:  # merge by id
                 for key in ("categories", "statuses", "templates", "source_types"):
@@ -1707,6 +2363,14 @@ async def import_all(body: ImportIn) -> Dict[str, Any]:
                     for item in inc.get(key, []) or []:
                         if isinstance(item, dict) and item.get("id") not in have:
                             existing.append(item)
+                # context_review is a settings object, not an id-keyed list:
+                # merge its known keys over the current values.
+                if isinstance(inc.get("context_review"), dict):
+                    cr = cfg.setdefault("context_review", _clone(_DEFAULT_CONTEXT_REVIEW))
+                    cr.update({
+                        k: v for k, v in inc["context_review"].items()
+                        if k in _DEFAULT_CONTEXT_REVIEW
+                    })
             _save_config(cfg)
             result["config_updated"] = True
 

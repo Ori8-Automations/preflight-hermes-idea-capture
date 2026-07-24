@@ -75,44 +75,81 @@ captures. It summarizes public source material, suggests a classification, and
 asks the operator one concise follow-up when the reason for saving an item is
 missing — without ever turning a thought into active work.
 
-**This release ships the backend contract.** The feature is **off by default**
-and stays fully inert until an operator enables it (`PATCH
-/config/context-review`) *and* installs a reviewer. Preflight is completely
-functional with it disabled, and existing v1.0 data loads unchanged.
+**This release ships the v1.1 backend.** The feature is **off by default** and
+stays fully inert — no events, no network, no messages — until an operator
+enables it (`PATCH /config/context-review`) *and* configures a route. Preflight
+is completely functional with it disabled, and existing v1.0 data loads
+unchanged.
 
-What's implemented:
+### Capture and the outbox
 
-- A **durable local outbox** (`<DATA_ROOT>/events/{pending,delivered,failed}`).
-  Idea persistence stays authoritative and completes first; enqueue is
-  best-effort and never blocks or fails capture.
-- An **idempotent, revision-bound event** per capture (idempotency key =
-  `event_type + idea_id + input_revision`). Duplicate delivery creates no
-  duplicate reviews or messages, and a **stale event can't overwrite** a review
-  recorded for newer idea bytes.
+- A **durable local outbox**
+  (`<DATA_ROOT>/events/{pending,processing,delivered,failed}`). Idea persistence
+  stays authoritative and completes first; enqueue is best-effort and never
+  blocks or fails capture.
+- **Idempotent, revision-bound events** (key = `event_type + idea_id +
+  input_revision + generation`). Duplicate delivery creates no duplicate reviews
+  or messages, and a **stale event can't overwrite** a review recorded for newer
+  idea bytes.
+- The **input revision covers operator-authored timeline updates**, not just the
+  form fields — a note carrying the missing "why" correctly invalidates an
+  in-flight event instead of letting it review changed content.
+- A **grace period** (default 600s) is enforced before an event becomes due, so
+  a capture the operator is still editing isn't reviewed mid-thought. A drain
+  that runs too early burns no retry budget.
+- **Single-consumer claims**: each event is leased by an atomic rename into
+  `processing/`, so concurrent drains never double-process one event. Abandoned
+  leases are reclaimed. Writes are `fsync`'d with collision-safe temp names.
+- **Bounded retries** everywhere, including the no-route case, and **retention
+  pruning** actually runs on each drain.
+
+### Review, intent, and notifications
+
 - A **bounded review envelope** stored alongside the idea (never blended into
   `notes_markdown`). Source facts, agent suggestions, and operator intent stay
-  in separate sub-objects.
-- **Correlation-token intent capture** with fail-closed semantics: malformed,
-  used, mismatched, ambiguous, or superseded-revision tokens are all refused;
-  replaying the same answer is idempotent; `not sure anymore` is a valid answer.
+  in separate sub-objects; a suggested classification is never treated as intent.
+- **Correlation-token intent capture**, fail-closed: malformed, used,
+  superseded-revision, **expired**, and **ambiguous** tokens are all refused.
+  Token resolution handles zero/one/many matches explicitly, so two imported
+  ideas sharing a token can never be answered by a guess. Replaying the same
+  answer is idempotent; `not sure anymore` is a valid answer.
+- **`Review again` does real work and is non-destructive**: it bumps a review
+  *generation* so a re-review is a distinct event even for byte-identical
+  content, and the previous completed review stays visible (flagged
+  `review_pending`) until a replacement actually lands.
+- **Notification budget**: nothing is sent when intent is present, at most one
+  unanswered follow-up per idea generation, and captures arriving within
+  `digest_window_seconds` are grouped into a single **digest** instead of N
+  alerts.
+
+### Transport, retrieval, and authority
+
+- **HMAC-SHA256 webhook delivery** to a configured reviewer. The payload carries
+  only ids and the revision — never the idea body or fetched source content.
+  An **empty secret fails closed** (signing raises rather than minting a
+  forgeable signature), and the webhook target is SSRF-validated before any
+  request is made.
+- **Bounded public-source retrieval** (`fetch_public_source`): absolute http(s)
+  only, SSRF re-validation **on every redirect hop** (not just the first),
+  redirect-count / size / declared-content-length / timeout limits, text-only
+  content types (no binary downloads), and redirect-loop detection. Only a
+  bounded summary and retrieval metadata are persisted — never the raw body.
+  Fetched pages are treated as **untrusted data, never instructions**.
 - **Authority limits enforced in code**: a reviewer may only write the review
   envelope and append a review/intent timeline note. It cannot change the
   operator-authored title, summary, notes, category, status, priority, tags,
   archive, or promotion state, and no raw page bodies, cookies, or secrets are
   persisted.
-- **SSRF-safe source-URL validation** (`validate_public_url`) rejecting
-  loopback, private, link-local, reserved, IPv4-mapped, and cloud-metadata
-  destinations, plus **HMAC-SHA256 webhook signing** helpers.
-- A **fixture reviewer hook** (`set_reviewer`) so the whole path is testable
-  offline. No live webhook delivery is wired on by default; enabling live
-  delivery to Hermes additionally requires granting the plugin network access
-  (`permissions.network`), which stays `false` in this package.
+- Both network boundaries are **injected seams** (`set_http_transport`), so the
+  full webhook and fetch paths are exercised offline in tests.
 
-Not yet implemented: the **review UI** (badges, source/intent/agent sections,
+Network access is declared in `plugin.yaml` because live delivery and retrieval
+need it; neither is reachable unless the feature is enabled and a route is set.
+
+Still deferred: the **review UI** (badges, source/intent/agent sections,
 `Review again` / `Answer` / `Dismiss` controls). The dashboard bundle
 (`dist/index.js`) is a prebuilt artifact with no source in this repo, so the UI
-is deferred to a follow-up once the frontend source is available. All review
-state is exposed via the API below in the meantime.
+awaits the frontend source. All review state is exposed via the API below.
 
 See the [v1.1 context review and intent capture specification](docs/v1.1-context-review-and-intent-capture.md)
 for the full event model, security boundary, notification budget, and
@@ -183,10 +220,20 @@ File-backed JSON, all under a single allow-listed data root:
     idea_<id>.json        # one file per idea
   attachments/            # reserved for future use
   events/                 # v1.1 review outbox (created lazily)
-    pending/              #   enqueued, awaiting a reviewer
-    delivered/            #   reviewed successfully
+    pending/              #   enqueued, awaiting its grace period / a reviewer
+    processing/           #   claimed by a worker (lease; reclaimed if abandoned)
+    delivered/            #   reviewed or handed off successfully
     failed/               #   stale or exhausted retries
 ```
+
+There is no background thread: the outbox is driven explicitly by
+`POST /review-events/drain` (and follow-ups by
+`POST /review-events/send-followups`), so nothing happens on a schedule you
+didn't configure. Durability guarantee: each event and idea file is written to a
+uniquely-named temp file, `fsync`'d, then atomically renamed, with a best-effort
+directory `fsync` — so a completed write survives a crash. In-process locking is
+process-local; cross-process safety comes from the atomic-rename claim, not the
+lock.
 
 Default `DATA_ROOT` is `$HERMES_HOME/idea-capture` (falling back to
 `~/.hermes/idea-capture`). Override it with the `PREFLIGHT_IDEA_CAPTURE_DIR`
@@ -209,6 +256,15 @@ with **Import** (merge or replace).
   `http://` or `https://` URLs. Unsafe schemes are blanked on create, update,
   import, export, and Kanban draft output.
 - **No secrets/logs access, no external dependencies.**
+- **Network is opt-in and inert by default:** the only outbound paths belong to
+  v1.1 context review (webhook delivery, public-source retrieval). Both require
+  the feature to be enabled *and* a route configured. Every destination —
+  including each redirect hop — is re-validated against loopback, private,
+  link-local, reserved, IPv4-mapped, and cloud-metadata ranges before a request
+  is made. Webhook delivery refuses to sign with an empty secret.
+- **Review cannot create work:** a reviewer may only write the review envelope
+  and append a timeline note. It can never change operator-authored fields or an
+  idea's status, archive, or promotion state.
 
 ## Idea record shape
 
@@ -260,8 +316,10 @@ separate `source` / `classification` / `intent` sub-objects — see the
 | GET | `/export` | Export the full dataset (config + all ideas) as JSON |
 | POST | `/import` | Import a dataset (`mode`: `merge` or `replace`) |
 | PATCH | `/config/context-review` | Toggle/configure v1.1 review (off by default) |
-| GET | `/review-events` | Outbox diagnostics (pending/delivered/failed; no secrets) |
-| POST | `/ideas/{id}/review-events` | Enqueue/re-enqueue review for the current revision |
+| GET | `/review-events` | Outbox diagnostics (pending/processing/delivered/failed; no secrets) |
+| POST | `/review-events/drain` | Process due events now (grace-gated, lease-claimed) |
+| POST | `/review-events/send-followups` | Deliver due follow-ups, batching into a digest |
+| POST | `/ideas/{id}/review-events` | Enqueue/re-enqueue review (bumps generation) |
 | GET | `/ideas/{id}/review` | Return the review envelope (may be `null`) |
 | POST | `/ideas/{id}/intent-answer` | Append operator intent, bound to a correlation token |
 | POST | `/ideas/{id}/review-dismiss` | Dismiss the follow-up without changing disposition |
@@ -321,9 +379,12 @@ updates, export/import round-trip, custom source-type restore into a fresh data
 root, source URL scheme safety, mobile stylesheet checks, promote-draft with `{}` **and** with no body,
 bad-id rejection, and path-traversal safety). A second suite
 (`tests/review_test.py`) covers the v1.1 acceptance matrix — capture durability,
-the durable outbox, review correctness, intent-token correlation, notification
-budgeting, SSRF source safeguards, HMAC transport, authority limits, and v1.0
-compatibility:
+outbox grace timing / leases / bounded retry / retention, concurrent drains,
+review correctness, intent-token correlation including ambiguity and expiry,
+notification budgeting and digest batching, HMAC webhook transport, bounded
+source retrieval with redirect-hop SSRF checks and size/type limits, authority
+limits, and v1.0 compatibility. Both HTTP boundaries are injected seams, so the
+whole path runs offline:
 
 ```bash
 ./tests/run_tests.sh
