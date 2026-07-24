@@ -97,18 +97,39 @@ unchanged.
 - A **grace period** (default 600s) is enforced before an event becomes due, so
   a capture the operator is still editing isn't reviewed mid-thought. A drain
   that runs too early burns no retry budget.
-- **Single-consumer claims**: each event is leased by an `O_CREAT | O_EXCL`
-  create of its `processing/` path — the kernel guarantees exactly one winner,
-  and losers get `EEXIST`. (Plain `rename` is deliberately *not* used as the
-  claim: it replaces an existing destination, so it cannot express "claim only
-  if unclaimed".) The lease owner and timestamp are written as part of that same
-  create, so a processing file is never visible without a lease — closing the
-  window where a concurrent reclaim would judge it stale and resurrect an event
-  another worker was already handling. An unstamped lease is never treated as
-  stale, expired leases are reclaimed, and a displaced owner is blocked from
-  writing its result. Writes are `fsync`'d with collision-safe temp names.
+- **Single-consumer claims**: a claim is published only once it is already
+  complete. The full lease (owner + timestamp) is written to a unique temp file
+  and `fsync`'d, then `os.link()`'d onto the `processing/` path — `link()` fails
+  with `EEXIST`, making it a no-clobber atomic publish with exactly one winner.
+  Two primitives are deliberately *not* used: plain `rename` (it replaces an
+  existing destination, so it cannot express "claim only if unclaimed") and
+  `O_EXCL`-create-then-write (it publishes an *empty* file first, so a crash
+  between the two steps leaves a malformed lease that blocks every future claim
+  and strands the event). Because the published file is complete, there is no
+  window in which a concurrent reclaim can see an unstamped lease and resurrect
+  an event another worker holds.
+- **Bounded recovery**: a live lease is never touched; an expired lease returns
+  to `pending` with its owner invalidated; a malformed or incomplete claim
+  artifact is quarantined once it is provably not in flight, so junk can never
+  block claims forever. Orphaned claim temp files are swept.
+- **Ownership binds every side effect**: the lease is verified before the webhook
+  send, before a failure write or retry, and again atomically with the review
+  apply and final queue transition. A displaced owner cannot send, apply, retry,
+  fail, or delete another owner's queue state.
+- **Crash semantics**: dying mid-claim costs a delay, never a double review and
+  never a stranded event. Writes are `fsync`'d with collision-safe temp names.
 - **Bounded retries** everywhere, including the no-route case, and **retention
   pruning** actually runs on each drain.
+- **Follow-up notification** is a claim → send → compare-and-swap transition
+  bound to (revision, generation, token), so concurrent senders produce one
+  physical message and an answer or newer generation arriving mid-flight is never
+  overwritten back to `followup_sent`. Delivery is **at-least-once**: each
+  message carries a stable `idempotency_key` so a sink that can deduplicate will
+  collapse a retry after a crash between send and acknowledgement.
+- **Imported tokens fail closed**: a token with missing, malformed, or elapsed
+  issuance/expiry is retired on import, as is one colliding with *any* retained
+  token — including answered history — so an import cannot resurrect a used
+  token as a new answerable one. A missing expiry never means "never expires".
 
 ### Review, intent, and notifications
 

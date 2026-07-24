@@ -68,6 +68,9 @@ _LOCK = threading.RLock()
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _IDEA_ID_RE = re.compile(r"^idea_[a-z0-9]{6,32}$")
 _EVENT_ID_RE = re.compile(r"^evt_[a-z0-9]{6,32}$")
+# Suffix for in-flight claim temp files (see _claim_event). Deliberately not
+# matched by the evt_*.json glob so a temp file is never mistaken for a lease.
+_CLAIM_TMP_SUFFIX = ".claim-tmp"
 # Correlation tokens are human-readable and non-authoritative on their own; a
 # write always requires server-side resolution in addition to the token. The
 # alphabet drops easily-confused characters (0/O, 1/I).
@@ -323,6 +326,12 @@ def _load_config() -> Dict[str, Any]:
         cfg = {}
     cfg.setdefault("categories", [])
     cfg.setdefault("statuses", [])
+    # A usable status list is an invariant: every idea carries a status, so an
+    # empty list would make the API report that no status exists while records
+    # still reference one. Reseed the defaults rather than create values the
+    # API says do not exist.
+    if not isinstance(cfg.get("statuses"), list) or not cfg["statuses"]:
+        cfg["statuses"] = _clone(_DEFAULT_STATUSES)
     # Lazily seed fields for installs created before they existed.
     if "templates" not in cfg:
         cfg["templates"] = _clone(_DEFAULT_TEMPLATES)
@@ -345,6 +354,16 @@ def _review_config() -> Dict[str, Any]:
 
 def _save_config(cfg: Dict[str, Any]) -> None:
     _atomic_write(CONFIG_FILE, cfg)
+
+
+def _valid_status(value: Any) -> str:
+    """Coerce a status to one that actually exists in the configuration."""
+    statuses = _load_config()["statuses"]
+    ids = {s.get("id") for s in statuses if isinstance(s, dict)}
+    if isinstance(value, str) and value in ids:
+        return value
+    first = next((s.get("id") for s in statuses if isinstance(s, dict) and s.get("id")), None)
+    return first or _DEFAULT_STATUSES[0]["id"]
 
 
 def _find_category(cfg: Dict[str, Any], cat_id: str) -> Optional[Dict[str, Any]]:
@@ -438,12 +457,16 @@ def _clean_source_type(value: Any) -> str:
     return value if value in ids else ""
 
 
-def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_idea(raw: Dict[str, Any], seen_tokens: Optional[set] = None) -> Dict[str, Any]:
     """Build a safe, well-formed idea record from an arbitrary (imported) dict.
 
     Keeps only known fields, coerces types, validates the id (regenerating it
     if missing/invalid so imports can never write outside the ideas dir), and
     ensures timestamps exist.
+
+    ``seen_tokens`` accumulates every correlation token already reserved (on disk
+    and earlier in this import batch) so a duplicate imported token is retired
+    rather than becoming a second answerable copy.
     """
     now = _now()
     idea_id = raw.get("id")
@@ -469,7 +492,7 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
         "title": str(raw.get("title") or "(untitled)").strip()[:300],
         "category": raw.get("category") or None,
         "subcategory": raw.get("subcategory") or None,
-        "status": raw.get("status") or _DEFAULT_STATUSES[0]["id"],
+        "status": _valid_status(raw.get("status")),
         "priority": priority if priority in _PRIORITIES else "",
         "source_url": _clean_url(raw.get("source_url")),
         "source_type": _clean_source_type(raw.get("source_type")),
@@ -482,9 +505,13 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
         "promoted_to_kanban": _clean_promoted_to_kanban(raw.get("promoted_to_kanban")),
         "archived": archived,
         "archived_at": str(raw["archived_at"]) if archived and raw.get("archived_at") else None,
-        # v1.1: carry an existing review envelope through import/export untouched
-        # (sanitized), or None. Never fabricated for imported ideas.
-        "review": _sanitize_review(raw.get("review")),
+        # v1.1: carry an existing review envelope through import/export
+        # (sanitized), or None. Never fabricated for imported ideas. Imported
+        # follow-up tokens are vetted and fail closed.
+        "review": _vet_imported_review(
+            _sanitize_review(raw.get("review")),
+            seen_tokens if seen_tokens is not None else set(),
+        ),
     }
 
 
@@ -619,11 +646,81 @@ def _sanitize_review(raw: Any) -> Optional[Dict[str, Any]]:
             "sent_at": _s((raw.get("followup") or {}).get("sent_at"), 40) or None,
             "channel": _one_of((raw.get("followup") or {}).get("channel"), _FOLLOWUP_MODES, None),
             "digest_id": _s((raw.get("followup") or {}).get("digest_id"), 64) or None,
-        } if isinstance(raw.get("followup"), dict) else {"sent_at": None, "channel": None, "digest_id": None},
+            # A send claim, so two concurrent senders cannot both physically
+            # deliver the same follow-up. Held between selection and persist.
+            "claim_id": _s((raw.get("followup") or {}).get("claim_id"), 64) or None,
+            "claimed_at": _s((raw.get("followup") or {}).get("claimed_at"), 40) or None,
+        } if isinstance(raw.get("followup"), dict) else {
+            "sent_at": None, "channel": None, "digest_id": None,
+            "claim_id": None, "claimed_at": None,
+        },
+        # Diagnostics for the most recent *attempt*, kept separate from the
+        # review result so a failed re-review can be reported without destroying
+        # the last completed review the UI is showing.
+        "last_attempt": {
+            "generation": max(1, min(int((raw.get("last_attempt") or {}).get("generation") or 1), 10_000)),
+            "status": _one_of((raw.get("last_attempt") or {}).get("status"),
+                              {"failed", "succeeded"}, None),
+            "error_code": _s((raw.get("last_attempt") or {}).get("error_code"), 120) or None,
+            "at": _s((raw.get("last_attempt") or {}).get("at"), 40) or None,
+        } if isinstance(raw.get("last_attempt"), dict) else None,
         "created_at": _s(raw.get("created_at"), 40) or None,
         "updated_at": _s(raw.get("updated_at"), 40) or None,
         "error_code": _s(raw.get("error_code"), 120) or None,
     }
+
+
+# States that represent a review that actually completed and produced content
+# worth preserving across a failed replacement attempt.
+_COMPLETED_REVIEW_STATES = {
+    "reviewed", "needs_context", "followup_sent", "answered", "dismissed",
+}
+
+
+def _record_attempt_failure(event: Dict[str, Any], idea: Dict[str, Any], error_code: str) -> None:
+    """Record that a review attempt failed, preserving any completed review.
+
+    A failed replacement must not destroy the evidence the UI deliberately keeps
+    visible during ``review_pending``. So:
+
+    * if a completed review exists, keep it verbatim and record the failure in
+      ``last_attempt`` (clearing ``review_pending``, since nothing is in flight);
+    * only when there is no completed review to protect does the envelope itself
+      become ``failed`` — there is nothing to lose in that case.
+    """
+    generation = int(event.get("generation", 1))
+    now = _now()
+    existing = idea.get("review") if isinstance(idea.get("review"), dict) else None
+    attempt = {
+        "generation": generation,
+        "status": "failed",
+        "error_code": error_code,
+        "at": now,
+    }
+
+    if existing and existing.get("state") in _COMPLETED_REVIEW_STATES:
+        preserved = _sanitize_review(dict(existing))
+        preserved["review_pending"] = False   # the attempt is over
+        preserved["last_attempt"] = attempt
+        preserved["updated_at"] = now
+        try:
+            _apply_review(
+                event["idea_id"], preserved,
+                f"Re-review attempt (generation {generation}) failed; "
+                "previous review retained.",
+            )
+        except HTTPException:
+            pass  # a newer review landed meanwhile; leave it alone
+        return
+
+    review = _blank_review(event["idea_revision"], generation)
+    review["state"] = "failed"
+    review["error_code"] = error_code
+    review["last_attempt"] = attempt
+    try:
+        _apply_review(event["idea_id"], review, "Review failed; idea preserved.")
+    except HTTPException:
+        pass  # a newer review already exists; leave it alone
 
 
 def _blank_review(input_revision: str, generation: int = 1) -> Dict[str, Any]:
@@ -702,9 +799,77 @@ def _all_known_tokens() -> set:
 
 
 def _token_expired(intent: Dict[str, Any]) -> bool:
-    """True when the token's expiry has passed. Absent expiry never expires."""
-    exp = _parse_ts(intent.get("token_expires_at"))
-    return exp is not None and _now_dt() > exp
+    """True when a token must no longer be answerable.
+
+    Fails **closed**: a missing or unparseable expiry counts as expired rather
+    than "never expires". Every token this build mints carries a valid expiry, so
+    the only way to reach this path without one is imported or hand-edited data —
+    exactly the case that must not be trusted.
+    """
+    raw = intent.get("token_expires_at")
+    if not raw:
+        return True                      # no expiry → not answerable
+    exp = _parse_ts(raw)
+    if exp is None:
+        return True                      # malformed expiry → not answerable
+    return _now_dt() > exp
+
+
+def _retire_imported_token(review: Dict[str, Any], reason: str) -> None:
+    """Make an untrustworthy imported follow-up token unanswerable.
+
+    The question and review content are kept for the operator, but the token
+    itself is cleared so no reply can bind to it. A fresh ``Review again`` mints
+    a valid, unique token.
+    """
+    intent = review.get("intent") or {}
+    intent["correlation_token"] = None
+    intent["status"] = "missing"
+    intent["token_issued_at"] = None
+    intent["token_expires_at"] = None
+    review["intent"] = intent
+    review["error_code"] = reason
+    if review.get("state") in ("followup_sent", "needs_context"):
+        review["state"] = "needs_context"
+    followup = review.get("followup") or {}
+    followup["sent_at"] = None
+    followup["claim_id"] = None
+    followup["claimed_at"] = None
+    review["followup"] = followup
+
+
+def _vet_imported_review(review: Optional[Dict[str, Any]], seen_tokens: set) -> Optional[Dict[str, Any]]:
+    """Validate an imported review envelope's token, failing closed.
+
+    An imported token stays answerable only if it has a valid issuance AND
+    expiry timestamp and is unique across **every** retained token state — not
+    merely against currently-pending ideas. Answered history counts, so an import
+    cannot resurrect a used token as a new pending one.
+    """
+    if not isinstance(review, dict):
+        return review
+    intent = review.get("intent") or {}
+    token = intent.get("correlation_token")
+    if not token:
+        return review
+
+    if intent.get("status") == "requested":
+        issued = _parse_ts(intent.get("token_issued_at"))
+        expires = _parse_ts(intent.get("token_expires_at"))
+        if issued is None or expires is None:
+            _retire_imported_token(review, "imported_token_missing_timestamps")
+            return review
+        if _now_dt() > expires:
+            _retire_imported_token(review, "imported_token_expired")
+            return review
+        if token in seen_tokens:
+            _retire_imported_token(review, "imported_token_collision")
+            return review
+
+    # Reserve the token against every later import in this batch, whatever its
+    # state, so answered history cannot be reused either.
+    seen_tokens.add(token)
+    return review
 
 
 # ---- SSRF-safe public source retrieval guard ------------------------------- #
@@ -1033,7 +1198,28 @@ def _notify(kind: str, payload: Dict[str, Any]) -> bool:
         return False
 
 
-def send_due_followups() -> Dict[str, Any]:
+def _followup_identity(review: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    """The (revision, generation, token) a follow-up send is bound to."""
+    intent = review.get("intent") or {}
+    return (
+        review.get("input_revision"),
+        int(review.get("generation") or 1),
+        intent.get("correlation_token"),
+    )
+
+
+def _followup_idempotency_key(idea_id: str, review: Dict[str, Any]) -> str:
+    """Stable key for one logical follow-up, so a sink can deduplicate.
+
+    Derived only from the bound identity, so a retry after a crash between
+    physical send and acknowledgement reproduces the same key.
+    """
+    revision, generation, token = _followup_identity(review)
+    basis = f"{idea_id}:{revision}:{generation}:{token}"
+    return "fu_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+
+
+def send_due_followups(claim_ttl_seconds: int = 300) -> Dict[str, Any]:
     """Deliver pending follow-ups, grouping close-together ones into a digest.
 
     Notification budget, enforced here:
@@ -1042,13 +1228,37 @@ def send_due_followups() -> Dict[str, Any]:
         (``followup.sent_at`` is the guard);
       - captures whose follow-ups fall inside ``digest_window_seconds`` of each
         other are grouped into a single digest message instead of N alerts.
+
+    Concurrency protocol — claim, send, compare-and-swap:
+
+    1. **Claim** (locked): each due follow-up gets a durable ``claim_id``
+       persisted before the lock is released, so a second concurrent caller sees
+       it as claimed and selects nothing. Stale claims expire after
+       ``claim_ttl_seconds`` so a crashed sender does not block delivery.
+    2. **Send** (unlocked): one physical notification carrying a stable
+       ``idempotency_key`` per logical follow-up.
+    3. **Commit** (locked): the ``sent_at`` write is applied only if the review
+       still has the same revision, generation, token, and ``claim_id``. An
+       answer or a newer generation that landed mid-flight therefore wins and is
+       never overwritten back to ``followup_sent``.
+
+    Delivery is **at-least-once**, not exactly-once: if the process dies between
+    the physical send and the commit, the claim expires and the follow-up is sent
+    again. The ``idempotency_key`` is stable across those retries specifically so
+    a sink that can deduplicate will collapse them; a sink that cannot may show
+    the message twice.
     """
     cfg = _review_config()
     if not cfg.get("enabled") or cfg.get("followup_delivery", "none") == "none":
         return {"sent": 0, "digest": False, "skipped": "delivery disabled"}
 
     window = int(cfg.get("digest_window_seconds", 900) or 900)
-    due: List[Dict[str, Any]] = []
+    channel = cfg.get("followup_delivery", "none")
+    claim_id = "fc_" + uuid.uuid4().hex[:16]
+    now_dt = _now_dt()
+
+    # ---- 1. claim, durably, before releasing the lock -------------------- #
+    claimed: List[Dict[str, Any]] = []
     with _LOCK:
         for path in sorted(IDEAS_DIR.glob("idea_*.json")):
             idea = _read_json(path, None)
@@ -1065,19 +1275,29 @@ def send_due_followups() -> Dict[str, Any]:
                 continue          # already sent one for this generation
             if _token_expired(intent):
                 continue
-            due.append(idea)
+            held = followup.get("claim_id")
+            if held:
+                held_at = _parse_ts(followup.get("claimed_at"))
+                if held_at is not None and (now_dt - held_at).total_seconds() <= claim_ttl_seconds:
+                    continue      # another sender is mid-flight
+            followup = dict(followup)
+            followup["claim_id"] = claim_id
+            followup["claimed_at"] = _now()
+            review["followup"] = followup
+            idea["review"] = _sanitize_review(review)
+            _atomic_write(_idea_path(idea["id"]), idea)
+            claimed.append(idea)
 
-    if not due:
+    if not claimed:
         return {"sent": 0, "digest": False}
 
     # Group by review timestamp proximity to decide digest vs single message.
-    stamps = [_parse_ts((i.get("review") or {}).get("updated_at")) for i in due]
+    stamps = [_parse_ts((i.get("review") or {}).get("updated_at")) for i in claimed]
     stamps = [s for s in stamps if s]
     span = (max(stamps) - min(stamps)).total_seconds() if len(stamps) > 1 else 0
-    as_digest = len(due) > 1 and span <= window
-
-    channel = cfg.get("followup_delivery", "none")
+    as_digest = len(claimed) > 1 and span <= window
     digest_id = "dg_" + uuid.uuid4().hex[:12] if as_digest else None
+
     items = [
         {
             "idea_id": i["id"],
@@ -1085,30 +1305,78 @@ def send_due_followups() -> Dict[str, Any]:
             "token": ((i.get("review") or {}).get("intent") or {}).get("correlation_token"),
             "question": ((i.get("review") or {}).get("intent") or {}).get("question"),
             "source_title": ((i.get("review") or {}).get("source") or {}).get("title"),
+            "idempotency_key": _followup_idempotency_key(i["id"], i.get("review") or {}),
         }
-        for i in due
+        for i in claimed
     ]
-    ok = _notify("digest" if as_digest else "followup",
-                 {"items": items, "digest_id": digest_id})
+
+    # ---- 2. one physical send ------------------------------------------- #
+    ok = _notify(
+        "digest" if as_digest else "followup",
+        {
+            "items": items,
+            "digest_id": digest_id,
+            "idempotency_key": digest_id or items[0]["idempotency_key"],
+        },
+    )
 
     if not ok:
+        # Release the claims so a working sink can retry immediately.
+        with _LOCK:
+            for stub in claimed:
+                idea = _read_json(_idea_path(stub["id"]), None)
+                if not isinstance(idea, dict):
+                    continue
+                review = idea.get("review")
+                if not isinstance(review, dict):
+                    continue
+                followup = review.get("followup") or {}
+                if followup.get("claim_id") != claim_id:
+                    continue
+                followup["claim_id"] = None
+                followup["claimed_at"] = None
+                review["followup"] = followup
+                idea["review"] = _sanitize_review(review)
+                _atomic_write(_idea_path(idea["id"]), idea)
         return {"sent": 0, "digest": as_digest, "skipped": "no sink"}
 
+    # ---- 3. commit only where the bound identity still holds ------------- #
     now = _now()
-    for idea_stub in due:
+    committed = 0
+    for stub in claimed:
+        expected = _followup_identity(stub.get("review") or {})
         with _LOCK:
-            idea = _read_json(_idea_path(idea_stub["id"]), None)
+            idea = _read_json(_idea_path(stub["id"]), None)
             if not isinstance(idea, dict):
                 continue
             review = idea.get("review")
             if not isinstance(review, dict):
                 continue
-            review["followup"] = {"sent_at": now, "channel": channel, "digest_id": digest_id}
+            followup = review.get("followup") or {}
+            intent = review.get("intent") or {}
+            # CAS: the world must not have moved under us.
+            if followup.get("claim_id") != claim_id:
+                continue                          # our claim was superseded
+            if _followup_identity(review) != expected:
+                continue                          # new generation / new token
+            if intent.get("status") != "requested":
+                continue                          # answered or dismissed mid-flight
+            review["followup"] = {
+                "sent_at": now, "channel": channel, "digest_id": digest_id,
+                "claim_id": None, "claimed_at": None,
+            }
             review["state"] = "followup_sent"
             review["updated_at"] = now
             idea["review"] = _sanitize_review(review)
             _atomic_write(_idea_path(idea["id"]), idea)
-    return {"sent": len(due), "digest": as_digest, "digest_id": digest_id}
+            committed += 1
+    return {
+        "sent": committed,
+        "claimed": len(claimed),
+        "digest": as_digest,
+        "digest_id": digest_id,
+        "delivery": "at-least-once",
+    }
 
 
 # ---- durable outbox -------------------------------------------------------- #
@@ -1190,8 +1458,18 @@ def _enqueue_event(
     return event
 
 
-def _move_event(event: Dict[str, Any], dest: Path) -> None:
-    """Write the event into ``dest`` and drop it from every other queue dir."""
+def _move_event(event: Dict[str, Any], dest: Path, *, owned: bool = False) -> bool:
+    """Write the event into ``dest`` and drop it from every other queue dir.
+
+    With ``owned=True`` the transition is refused unless this worker still holds
+    the processing lease, so a displaced owner cannot delete or overwrite the
+    queue state now belonging to someone else. Recovery paths pass
+    ``owned=False`` because taking over is exactly their job.
+
+    Returns True if the transition happened.
+    """
+    if owned and not _lease_is_mine(event):
+        return False
     _atomic_write(_event_path(dest, event["event_id"]), event)
     for d in (EVENTS_PENDING, EVENTS_PROCESSING, EVENTS_DELIVERED, EVENTS_FAILED):
         if d == dest:
@@ -1202,6 +1480,7 @@ def _move_event(event: Dict[str, Any], dest: Path) -> None:
                 stale.unlink()
             except OSError:
                 pass
+    return True
 
 
 def _event_is_due(event: Dict[str, Any]) -> bool:
@@ -1213,21 +1492,27 @@ def _event_is_due(event: Dict[str, Any]) -> bool:
 def _claim_event(event_id: str) -> Optional[Dict[str, Any]]:
     """Exclusively claim a pending event for this worker.
 
-    The claim primitive is an ``O_CREAT | O_EXCL`` create of the ``processing``
-    path: the kernel guarantees exactly one caller wins, and a loser gets
-    ``EEXIST``. Plain ``os.rename`` is NOT used here — rename silently replaces
-    an existing destination, so it cannot express "claim only if unclaimed".
+    Protocol — the visible claim is published only once it is already complete:
 
-    The lease (owner + timestamp) is written as part of that same create, so the
-    processing file is never visible without a lease. That closes the window
-    where a concurrent ``_reclaim_stale_leases()`` would see an unstamped file,
-    judge it infinitely stale, and resurrect an event that an active owner was
-    already processing.
+    1. write the full lease (owner + timestamp) to a unique temp file and fsync
+       it, so the bytes are durable *before* anything observable happens;
+    2. ``os.link()`` that temp file onto the ``processing`` path. ``link()``
+       fails with ``EEXIST`` if the destination exists, so it is a no-clobber
+       atomic publish and exactly one caller can win;
+    3. unlink the temp name and retire the ``pending`` copy.
 
-    Crash safety: if we die between creating ``processing`` and unlinking
-    ``pending``, both copies exist. The pending copy cannot be re-claimed (the
-    exclusive create fails), and lease expiry eventually returns the event to
-    pending — so a crash costs a delay, never a double review.
+    Neither ``rename`` nor "``O_EXCL`` create then write" is used. ``rename``
+    replaces an existing destination, so it cannot express "claim only if
+    unclaimed". Create-then-write publishes an *empty* file first, so a crash or
+    write error between the two steps leaves a malformed lease that blocks every
+    future claim — the event strands forever. Publishing an already-complete file
+    by link makes an incomplete visible lease impossible.
+
+    Crash safety: dying after step 2 leaves a valid lease plus a pending copy.
+    The pending copy cannot be re-claimed while the lease exists, and lease
+    expiry returns the event to pending. Dying before step 2 leaves only an
+    orphan temp file, which recovery sweeps. A crash costs a delay, never a
+    double review and never a stranded event.
 
     Returns the claimed event, or None if another worker owns it.
     """
@@ -1242,21 +1527,43 @@ def _claim_event(event_id: str) -> Optional[Dict[str, Any]]:
     ev["lease_at"] = _now()
     ev["lease_owner"] = "own_" + uuid.uuid4().hex[:16]
 
-    payload = json.dumps(ev, indent=2, ensure_ascii=False).encode("utf-8")
+    # Step 1: fully-formed, fsynced, and not yet reachable at the claim path.
+    tmp = dst.with_suffix(f".{uuid.uuid4().hex}{_CLAIM_TMP_SUFFIX}")
     try:
-        fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, json.dumps(ev, indent=2, ensure_ascii=False).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Nothing observable was published, so nothing can be stranded.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+
+    # Step 2: no-clobber atomic publish of the complete lease.
+    try:
+        os.link(str(tmp), str(dst))
     except FileExistsError:
+        tmp.unlink()
         return None  # another worker holds the lease
     except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         return None
-    try:
-        os.write(fd, payload)
-        os.fsync(fd)
     finally:
-        os.close(fd)
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
-    # We own the lease. Retire the pending copy; if it vanished under us, back
-    # the claim out rather than process an event we may not own.
+    # Step 3: we own a complete, durable lease. Retire the pending copy.
     try:
         os.unlink(str(src))
     except FileNotFoundError:
@@ -1271,8 +1578,9 @@ def _claim_event(event_id: str) -> Optional[Dict[str, Any]]:
 def _lease_is_mine(event: Dict[str, Any]) -> bool:
     """True if this worker still owns the event's processing lease.
 
-    Checked before any result is written, so an owner whose lease was reclaimed
-    (or taken over after a crash) cannot also apply its outcome.
+    Consulted before *every* side effect (webhook send, review apply, retry,
+    failure write, queue transition), so an owner whose lease was reclaimed or
+    taken over cannot act on the event any more.
     """
     owner = event.get("lease_owner")
     if not owner:
@@ -1283,24 +1591,95 @@ def _lease_is_mine(event: Dict[str, Any]) -> bool:
     return current.get("lease_owner") == owner
 
 
-def _reclaim_stale_leases(max_lease_seconds: int = 900) -> int:
-    """Return events abandoned mid-processing (crashed worker) to ``pending``.
+def _sweep_claim_temps(max_age_seconds: int = 900) -> int:
+    """Delete orphaned claim temp files from workers that died before publish.
 
-    Only leases older than ``max_lease_seconds`` are reclaimed. A lease with no
-    timestamp is deliberately NOT treated as stale — failing closed here is what
-    prevents resurrecting an event that an active owner is still processing.
+    These were never reachable at the claim path, so removing them can never
+    displace a live owner.
+    """
+    removed = 0
+    if not EVENTS_PROCESSING.exists():
+        return 0
+    cutoff = _now_dt().timestamp() - max_age_seconds
+    for path in EVENTS_PROCESSING.glob(f"*{_CLAIM_TMP_SUFFIX}"):
+        try:
+            if path.stat().st_mtime <= cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _reclaim_stale_leases(max_lease_seconds: int = 900) -> int:
+    """Return events abandoned mid-processing to ``pending``, and bound junk.
+
+    Three distinct cases, each failing closed:
+
+    * a **valid live** lease is never touched;
+    * a **valid expired** lease is returned to pending and its owner invalidated;
+    * a **malformed/incomplete** claim artifact (unparseable, empty, or missing
+      its lease stamp) is not a live owner and must not block claims forever, so
+      it is quarantined once it is older than the lease window. An unstamped but
+      *recent* artifact is left alone, so this can never displace a worker that
+      is mid-claim.
     """
     recovered = 0
-    for ev in _iter_events(EVENTS_PROCESSING):
-        leased = _parse_ts(ev.get("lease_at"))
-        if leased is None:
-            continue  # never resurrect an unstamped lease
-        if (_now_dt() - leased).total_seconds() > max_lease_seconds:
+    _sweep_claim_temps(max_lease_seconds)
+    if not EVENTS_PROCESSING.exists():
+        return 0
+
+    for path in sorted(EVENTS_PROCESSING.glob("evt_*.json")):
+        ev = _read_json(path, None)
+        stamped = _parse_ts(ev.get("lease_at")) if isinstance(ev, dict) else None
+
+        if stamped is not None:
+            if (_now_dt() - stamped).total_seconds() <= max_lease_seconds:
+                continue  # valid live lease — never resurrect
             ev["status"] = "pending"
             ev["last_error"] = "recovered from stale lease"
-            ev.pop("lease_owner", None)  # invalidate the old owner's claim
+            ev.pop("lease_owner", None)  # invalidate the displaced owner
             _move_event(ev, EVENTS_PENDING)
             recovered += 1
+            continue
+
+        # Malformed or unstamped: only actionable once it is provably not a
+        # claim in flight. Age is taken from the filesystem because the content
+        # is untrustworthy.
+        try:
+            age = _now_dt().timestamp() - path.stat().st_mtime
+        except OSError:
+            continue
+        if age <= max(max_lease_seconds, 0):
+            continue  # possibly mid-claim; leave it alone
+
+        event_id = path.stem
+        pending_copy = EVENTS_PENDING / f"{event_id}.json"
+        if pending_copy.exists():
+            # The pre-claim copy survived, so the queue entry is not lost —
+            # drop the unusable artifact and let the pending copy be claimed.
+            try:
+                path.unlink()
+                recovered += 1
+            except OSError:
+                pass
+            continue
+        # No pending copy: reconstruct a minimal pending entry from the id so
+        # the work is retried rather than stranded, and record why.
+        salvage = ev if isinstance(ev, dict) else {}
+        salvage.setdefault("event_id", event_id)
+        salvage["status"] = "pending"
+        salvage["last_error"] = "recovered from malformed claim artifact"
+        salvage.pop("lease_owner", None)
+        salvage.pop("lease_at", None)
+        if _EVENT_ID_RE.match(event_id) and salvage.get("idea_id"):
+            _move_event(salvage, EVENTS_PENDING)
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        recovered += 1
     return recovered
 
 
@@ -1357,17 +1736,29 @@ def _apply_review(idea_id: str, review: Dict[str, Any], timeline_note: Optional[
     return idea
 
 
+def _abandon(event: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """Stop working an event whose lease we no longer hold, changing nothing."""
+    event["status"] = "abandoned"
+    event["last_error"] = reason
+    return event
+
+
 def _retry_or_fail(event: Dict[str, Any], error: str, max_attempts: int) -> Dict[str, Any]:
-    """Send an event back to pending, or to failed once retries are exhausted."""
-    event["last_error"] = error
-    if int(event.get("attempts", 0)) >= max_attempts:
-        event["status"] = "failed"
-        with _LOCK:
-            _move_event(event, EVENTS_FAILED)
-    else:
-        event["status"] = "pending"
-        with _LOCK:
-            _move_event(event, EVENTS_PENDING)
+    """Send an event back to pending, or to failed once retries are exhausted.
+
+    Ownership-bound: a worker that lost its lease may not re-queue or fail an
+    event that another owner now holds.
+    """
+    with _LOCK:
+        if not _lease_is_mine(event):
+            return _abandon(event, "lease lost before retry/fail")
+        event["last_error"] = error
+        if int(event.get("attempts", 0)) >= max_attempts:
+            event["status"] = "failed"
+            _move_event(event, EVENTS_FAILED, owned=True)
+        else:
+            event["status"] = "pending"
+            _move_event(event, EVENTS_PENDING, owned=True)
     return event
 
 
@@ -1417,14 +1808,21 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     # --- external reviewer via authenticated webhook ---------------------- #
     webhook_url, _ = _webhook_target()
     if webhook_url:
+        # Ownership is checked BEFORE the send, not after: a webhook POST is an
+        # irreversible external side effect, so a displaced owner must never
+        # reach the network at all.
+        if not _lease_is_mine(event):
+            return _abandon(event, "lease lost before webhook delivery")
         ok, detail = deliver_event_webhook(event)
         if ok:
             # The external reviewer will post results back through the normal
             # review API; the event's job ends at successful hand-off.
-            event["status"] = "delivered"
-            event["last_error"] = None
             with _LOCK:
-                _move_event(event, EVENTS_DELIVERED)
+                if not _lease_is_mine(event):
+                    return _abandon(event, "lease lost after webhook delivery")
+                event["status"] = "delivered"
+                event["last_error"] = None
+                _move_event(event, EVENTS_DELIVERED, owned=True)
             return event
         if _REVIEWER is None:
             return _retry_or_fail(event, f"webhook: {detail}", max_attempts)
@@ -1438,38 +1836,35 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     # Last check before doing observable work: if our lease was reclaimed, the
     # event now belongs to someone else. Drop it rather than review it twice.
     if not _lease_is_mine(event):
-        event["status"] = "abandoned"
-        event["last_error"] = "lease lost before review"
-        return event
+        return _abandon(event, "lease lost before review")
 
     try:
         result = _REVIEWER(_idea_for_output(idea)) or {}
     except Exception as exc:  # noqa: BLE001 — bound any adapter failure
-        review = _blank_review(event["idea_revision"], int(event.get("generation", 1)))
-        review["state"] = "failed"
-        review["error_code"] = "reviewer_error"
-        try:
-            _apply_review(event["idea_id"], review, "Review failed; idea preserved.")
-        except HTTPException:
-            pass  # a newer review already exists; leave it alone
+        # A failure is still a write and a retry, so it is ownership-bound too:
+        # a displaced owner may not mark another owner's event failed.
+        with _LOCK:
+            if not _lease_is_mine(event):
+                return _abandon(event, "lease lost before failure write")
+            _record_attempt_failure(event, idea, "reviewer_error")
         return _retry_or_fail(event, f"reviewer error: {type(exc).__name__}", max_attempts)
 
     review = _build_review_from_result(idea, event["idea_revision"], result,
                                        int(event.get("generation", 1)))
-    # Re-verify ownership after the reviewer ran: a long review could have
-    # outlived its lease, and only the current owner may persist a result.
-    if not _lease_is_mine(event):
-        event["status"] = "abandoned"
-        event["last_error"] = "lease lost during review"
-        return event
-    try:
-        _apply_review(event["idea_id"], review, "Context review completed.")
-    except HTTPException as exc:
-        return _retry_or_fail(event, f"apply rejected: {exc.detail}", max_attempts)
-    event["status"] = "delivered"
-    event["last_error"] = None
+    # Ownership check, apply, and the queue transition happen inside one
+    # lock-bound critical section, so no reclaim can interleave between
+    # "we still own it" and "the result is committed".
     with _LOCK:
-        _move_event(event, EVENTS_DELIVERED)
+        if not _lease_is_mine(event):
+            return _abandon(event, "lease lost during review")
+        try:
+            _apply_review(event["idea_id"], review, "Context review completed.")
+        except HTTPException as exc:
+            detail = exc.detail
+            return _retry_or_fail(event, f"apply rejected: {detail}", max_attempts)
+        event["status"] = "delivered"
+        event["last_error"] = None
+        _move_event(event, EVENTS_DELIVERED, owned=True)
     return event
 
 
@@ -1939,7 +2334,7 @@ async def create_idea(body: IdeaIn) -> Dict[str, Any]:
         "title": body.title.strip(),
         "category": body.category,
         "subcategory": body.subcategory,
-        "status": body.status or (_DEFAULT_STATUSES[0]["id"]),
+        "status": _valid_status(body.status),
         "priority": body.priority if body.priority in _PRIORITIES else "",
         "source_url": _clean_url(body.source_url),
         "source_type": _clean_source_type(body.source_type),
@@ -2450,11 +2845,21 @@ async def import_all(body: ImportIn) -> Dict[str, Any]:
             if body.mode == "replace":
                 for path in IDEAS_DIR.glob("idea_*.json"):
                     path.unlink()
+            # Reserve every token that survives this import (merge keeps the
+            # existing corpus) so an imported duplicate is retired, not made a
+            # second answerable copy. Includes answered/dismissed history.
+            seen_tokens = _all_known_tokens()
+            retired = 0
             for raw in body.ideas:
                 if not isinstance(raw, dict):
                     continue
-                idea = _normalize_idea(raw)
+                idea = _normalize_idea(raw, seen_tokens)
+                review = idea.get("review")
+                if isinstance(review, dict) and str(review.get("error_code") or "").startswith("imported_token"):
+                    retired += 1
                 _atomic_write(_idea_path(idea["id"]), idea)
                 result["ideas_written"] += 1
+            if retired:
+                result["tokens_retired"] = retired
 
     return result

@@ -309,26 +309,74 @@ def main() -> int:
         "intent": {"status": "requested", "question": "why?", "correlation_token": "PF-ABCD",
                    "revision_bound": "sha256:x"},
     }
+    # Import now retires a duplicate token at the boundary (covered later), so
+    # to exercise the *resolution* layer's ambiguity guard we plant the collision
+    # directly on disk — the shape a hand-edited or externally-written data root
+    # could still produce. Both layers must fail closed independently.
     twins = []
     for suffix in ("aaaaaa", "bbbbbb"):
-        got = c_a.post(B + "/import", json={"mode": "merge", "ideas": [
-            {"id": f"idea_{suffix}", "title": f"Twin {suffix}", "review": dict(shared)}]}).json()
-        ok(got["ideas_written"] == 1, f"imported twin {suffix}")
-        twins.append(f"idea_{suffix}")
+        idea_id = f"idea_{suffix}"
+        planted = {
+            "id": idea_id, "title": f"Twin {suffix}", "status": "inbox", "priority": "",
+            "source_url": "", "source_type": "", "summary": "", "notes_markdown": "",
+            "tags": [], "updates": [], "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z", "promoted_to_kanban": None,
+            "archived": False, "archived_at": None,
+            "review": json.loads(json.dumps(shared)),
+        }
+        planted["review"]["intent"]["token_issued_at"] = "2026-07-01T00:00:00Z"
+        planted["review"]["intent"]["token_expires_at"] = "2099-01-01T00:00:00Z"
+        (pathlib.Path(amb_root) / "ideas" / f"{idea_id}.json").write_text(
+            json.dumps(planted), "utf-8")
+        twins.append(idea_id)
     idx = pa_a._token_index()
     ok(len(idx.get("PF-ABCD", [])) == 2, "token index reports BOTH ideas for a duplicated token")
     amb = c_a.post(B + f"/ideas/{twins[0]}/intent-answer", json={"token": "PF-ABCD", "answer": "x"})
     ok(amb.status_code == 409 and "ambiguous" in amb.json()["detail"], "ambiguous token fails closed")
 
     # --- token expiry ---------------------------------------------------- #
-    expired_review = dict(shared)
-    expired_review["intent"] = dict(shared["intent"])
+    # Importing an already-expired token retires it at the boundary, so the
+    # answer attempt fails closed on a retired token rather than reaching the
+    # expiry check.
+    expired_review = json.loads(json.dumps(shared))
     expired_review["intent"]["correlation_token"] = "PF-EXPD"
+    expired_review["intent"]["token_issued_at"] = "2019-01-01T00:00:00Z"
     expired_review["intent"]["token_expires_at"] = "2020-01-01T00:00:00Z"
     c_a.post(B + "/import", json={"mode": "merge", "ideas": [
         {"id": "idea_expired1", "title": "Expired", "review": expired_review}]})
+    ok(c_a.get(B + "/ideas/idea_expired1").json()["review"]["intent"]["correlation_token"] is None,
+       "an expired token is retired on import")
     exp_res = c_a.post(B + "/ideas/idea_expired1/intent-answer", json={"token": "PF-EXPD", "answer": "x"})
-    ok(exp_res.status_code == 409 and "expired" in exp_res.json()["detail"], "expired token fails closed")
+    ok(exp_res.status_code >= 400, "an expired imported token cannot be answered")
+
+    # The resolution layer's own expiry check, exercised by planting a token that
+    # was valid at write time but has since expired.
+    planted_exp = {
+        "id": "idea_expired2", "title": "Expired live", "status": "inbox", "priority": "",
+        "source_url": "", "source_type": "", "summary": "", "notes_markdown": "",
+        "tags": [], "updates": [], "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z", "promoted_to_kanban": None,
+        "archived": False, "archived_at": None,
+        "review": json.loads(json.dumps(shared)),
+    }
+    planted_exp["review"]["intent"]["correlation_token"] = "PF-EXPE"
+    planted_exp["review"]["intent"]["token_issued_at"] = "2020-01-01T00:00:00Z"
+    planted_exp["review"]["intent"]["token_expires_at"] = "2020-02-01T00:00:00Z"
+    (pathlib.Path(amb_root) / "ideas" / "idea_expired2.json").write_text(
+        json.dumps(planted_exp), "utf-8")
+    exp2 = c_a.post(B + "/ideas/idea_expired2/intent-answer", json={"token": "PF-EXPE", "answer": "x"})
+    ok(exp2.status_code == 409 and "expired" in exp2.json()["detail"],
+       "expired token fails closed at answer time")
+
+    # A token with no expiry at all must also fail closed (never "never expires").
+    planted_noexp = json.loads(json.dumps(planted_exp))
+    planted_noexp["id"] = "idea_noexpiry1"
+    planted_noexp["review"]["intent"]["correlation_token"] = "PF-NOEX"
+    planted_noexp["review"]["intent"].pop("token_expires_at", None)
+    (pathlib.Path(amb_root) / "ideas" / "idea_noexpiry1.json").write_text(
+        json.dumps(planted_noexp), "utf-8")
+    noexp = c_a.post(B + "/ideas/idea_noexpiry1/intent-answer", json={"token": "PF-NOEX", "answer": "x"})
+    ok(noexp.status_code >= 400, "a token with no expiry is not answerable (fails closed)")
 
     # Unknown-but-well-formed token is not pending anywhere.
     unk = c_a.post(B + "/ideas/idea_expired1/intent-answer", json={"token": "PF-ZZZZ", "answer": "x"})
@@ -614,6 +662,265 @@ def main() -> int:
     ok(pa_c._lease_is_mine(claimed) is False, "a reclaimed event's old owner cannot write results")
     pa_c.drain_pending()
     ok(_review_of(c_c, stranded["id"])["state"] == "needs_context", "reclaimed event is processed")
+
+    # === Crash-safe claim publish ======================================= #
+    # A claim must never publish an incomplete lease. If the write fails, the
+    # event must remain claimable rather than stranding behind a junk artifact.
+    crash_root = tempfile.mkdtemp(prefix="preflight-crash-")
+    pa_x, c_x = _fresh(crash_root)
+    _enable(c_x, grace_period_seconds=0)
+    pa_x.set_reviewer(reviewer_link_only)
+    c_x.post(B + "/ideas", json={"title": "Crash", "source_url": "https://example.com/cr"})
+    x_id = pa_x._iter_events(pa_x.EVENTS_PENDING)[0]["event_id"]
+
+    real_write = os.write
+    os.write = lambda fd, data: (_ for _ in ()).throw(OSError("injected write failure"))
+    try:
+        crashed = pa_x._claim_event(x_id)
+    except OSError:
+        crashed = "raised"
+    finally:
+        os.write = real_write
+    ok(crashed is None, "a claim whose write fails does not report success")
+    ok(not (pa_x.EVENTS_PROCESSING / f"{x_id}.json").exists(),
+       "a failed claim publishes no processing artifact")
+    ok((pa_x.EVENTS_PENDING / f"{x_id}.json").exists(), "the pending copy survives a failed claim")
+    ok(pa_x._claim_event(x_id) is not None, "the event is still claimable after a failed claim")
+    ok(not list(pa_x.EVENTS_PROCESSING.glob(f"*{pa_x._CLAIM_TMP_SUFFIX}")),
+       "no claim temp files are left behind")
+
+    # Malformed/incomplete artifacts are bounded, and never displace a live owner.
+    live = pa_x._read_json(pa_x.EVENTS_PROCESSING / f"{x_id}.json", None)
+    ok(pa_x._reclaim_stale_leases() == 0, "recovery leaves a live lease alone")
+    junk = pa_x.EVENTS_PROCESSING / "evt_junkaaaaaa01.json"
+    junk.write_text("", "utf-8")
+    ok(pa_x._reclaim_stale_leases() == 0, "a fresh malformed artifact is not touched (may be mid-claim)")
+    os.utime(junk, (0, 0))
+    ok(pa_x._reclaim_stale_leases() >= 1, "an aged malformed artifact is reclaimed")
+    ok(not junk.exists(), "the malformed artifact no longer blocks claims")
+    ok(pa_x._lease_is_mine(live) is True, "reclaiming junk did not displace the valid live owner")
+
+    # === Ownership bounds every side effect ============================= #
+    # Webhook: a displaced owner must not reach the network at all.
+    hook_root = tempfile.mkdtemp(prefix="preflight-own-hook-")
+    pa_h, c_h = _fresh(hook_root,
+                       PREFLIGHT_REVIEW_WEBHOOK_URL="https://hook.example.com/r",
+                       PREFLIGHT_REVIEW_WEBHOOK_SECRET="s3cret")
+    _enable(c_h, grace_period_seconds=0)
+    posts = []
+    pa_h.set_http_transport(post=lambda u, b, h: (posts.append(1), (200, "ok"))[1])
+    c_h.post(B + "/ideas", json={"title": "Own hook", "source_url": "https://example.com/oh"})
+    h_ev = pa_h._iter_events(pa_h.EVENTS_PENDING)[0]
+    h_claim = pa_h._claim_event(h_ev["event_id"])
+    pa_h._reclaim_stale_leases(max_lease_seconds=-1)   # displace the owner
+    h_out = pa_h.process_event(h_claim)
+    ok(len(posts) == 0, "a displaced owner never sends the webhook")
+    ok(h_out["status"] == "abandoned", "a displaced owner abandons instead of delivering")
+
+    # Reviewer exception: a displaced owner must not write a failure or retry.
+    exc_root = tempfile.mkdtemp(prefix="preflight-own-exc-")
+    pa_e, c_e = _fresh(exc_root)
+    _enable(c_e, grace_period_seconds=0)
+    pa_e.set_reviewer(reviewer_boom)
+    e_idea = c_e.post(B + "/ideas", json={"title": "Own exc", "source_url": "https://example.com/oe"}).json()
+    e_ev = pa_e._iter_events(pa_e.EVENTS_PENDING)[0]
+    e_claim = pa_e._claim_event(e_ev["event_id"])
+    pa_e._reclaim_stale_leases(max_lease_seconds=-1)
+    e_out = pa_e.process_event(e_claim)
+    ok(e_out["status"] == "abandoned", "a displaced owner does not mark the event failed")
+    ok(_review_of(c_e, e_idea["id"])["state"] == "waiting",
+       "a displaced owner does not write a failed review over another owner's event")
+
+    # A displaced owner cannot delete another owner's queue state.
+    q_root = tempfile.mkdtemp(prefix="preflight-own-queue-")
+    pa_q, c_q = _fresh(q_root)
+    _enable(c_q, grace_period_seconds=0)
+    pa_q.set_reviewer(reviewer_link_only)
+    c_q.post(B + "/ideas", json={"title": "Own queue", "source_url": "https://example.com/oq"})
+    q_ev = pa_q._iter_events(pa_q.EVENTS_PENDING)[0]
+    q_claim = pa_q._claim_event(q_ev["event_id"])
+    pa_q._reclaim_stale_leases(max_lease_seconds=-1)
+    pending_before = pa_q.EVENTS_PENDING / f"{q_ev['event_id']}.json"
+    ok(pending_before.exists(), "the reclaimed event is back in pending")
+    ok(pa_q._move_event(q_claim, pa_q.EVENTS_DELIVERED, owned=True) is False,
+       "an ownership-bound move by a displaced owner is refused")
+    ok(pending_before.exists(), "the displaced owner did not delete the new queue state")
+
+    # === Failed Review Again retains the completed review =============== #
+    again_root = tempfile.mkdtemp(prefix="preflight-again-")
+    pa_g, c_g = _fresh(again_root)
+    _enable(c_g, grace_period_seconds=0)
+    pa_g.set_reviewer(reviewer_link_only)
+    g_idea = c_g.post(B + "/ideas", json={"title": "Keep me", "source_url": "https://example.com/km"}).json()
+    pa_g.drain_pending()
+    g_before = _review_of(c_g, g_idea["id"])
+    ok(g_before["source"]["title"] == "Hermes Flightplan", "first review completed with source facts")
+    pa_g.set_reviewer(reviewer_boom)
+    c_g.post(B + f"/ideas/{g_idea['id']}/review-events")
+    pa_g.drain_pending()
+    g_after = _review_of(c_g, g_idea["id"])
+    ok(g_after["source"]["title"] == "Hermes Flightplan",
+       "a failed re-review retains the previous source summary")
+    ok(g_after["state"] == "needs_context", "a failed re-review does not overwrite the state with 'failed'")
+    ok(g_after["review_pending"] is False, "review_pending is cleared once the attempt ends")
+    ok((g_after.get("last_attempt") or {}).get("status") == "failed",
+       "the failed attempt is recorded separately in last_attempt")
+    ok((g_after.get("last_attempt") or {}).get("generation") == 2,
+       "last_attempt records which generation failed")
+
+    # === Notification budgeting is concurrency-safe ===================== #
+    note_root = tempfile.mkdtemp(prefix="preflight-note-conc-")
+    pa_n, c_n = _fresh(note_root)
+    _enable(c_n, grace_period_seconds=0, followup_delivery="preflight")
+    pa_n.set_reviewer(reviewer_link_only)
+    physical = []
+    p_lock = threading.Lock()
+
+    def counting_notifier(kind, payload):
+        with p_lock:
+            physical.append(payload)
+
+    pa_n.set_notifier(counting_notifier)
+    n_idea = c_n.post(B + "/ideas", json={"title": "Notify once", "source_url": "https://example.com/n1"}).json()
+    pa_n.drain_pending()
+    results = []
+    r_lock = threading.Lock()
+
+    def send_worker():
+        out = pa_n.send_due_followups()
+        with r_lock:
+            results.append(out)
+
+    n_threads = [threading.Thread(target=send_worker) for _ in range(4)]
+    for t in n_threads:
+        t.start()
+    for t in n_threads:
+        t.join()
+    ok(len(physical) == 1, f"4 concurrent senders produce exactly 1 physical send (got {len(physical)})")
+    ok(sum(r.get("sent", 0) for r in results) == 1, "exactly one sender commits the follow-up")
+    ok(bool(physical[0]["items"][0].get("idempotency_key")),
+       "the notification carries a stable idempotency key for sink dedup")
+    key_once = physical[0]["items"][0]["idempotency_key"]
+    ok(pa_n._followup_idempotency_key(n_idea["id"], _review_of(c_n, n_idea["id"])) == key_once,
+       "the idempotency key is stable across recomputation")
+
+    # An answer landing mid-flight must win over the in-flight send.
+    mid_root = tempfile.mkdtemp(prefix="preflight-note-mid-")
+    pa_m, c_m = _fresh(mid_root)
+    _enable(c_m, grace_period_seconds=0, followup_delivery="preflight")
+    pa_m.set_reviewer(reviewer_link_only)
+    m_idea = c_m.post(B + "/ideas", json={"title": "Answer mid", "source_url": "https://example.com/am"}).json()
+    pa_m.drain_pending()
+    m_tok = _review_of(c_m, m_idea["id"])["intent"]["correlation_token"]
+
+    def answer_during_send(kind, payload):
+        c_m.post(B + f"/ideas/{m_idea['id']}/intent-answer",
+                 json={"token": m_tok, "answer": "reference only"})
+
+    pa_m.set_notifier(answer_during_send)
+    m_res = pa_m.send_due_followups()
+    m_rev = _review_of(c_m, m_idea["id"])
+    ok(m_res["sent"] == 0, "a send whose bound state changed mid-flight does not commit")
+    ok(m_rev["intent"]["status"] == "answered", "the mid-flight answer is preserved")
+    ok(m_rev["state"] != "followup_sent", "an answered review is not overwritten back to followup_sent")
+
+    # A new generation landing mid-flight must also win.
+    gen_root = tempfile.mkdtemp(prefix="preflight-note-gen-")
+    pa_gg, c_gg = _fresh(gen_root)
+    _enable(c_gg, grace_period_seconds=0, followup_delivery="preflight")
+    pa_gg.set_reviewer(reviewer_link_only)
+    gg_idea = c_gg.post(B + "/ideas", json={"title": "Gen mid", "source_url": "https://example.com/gm"}).json()
+    pa_gg.drain_pending()
+
+    def regen_during_send(kind, payload):
+        c_gg.post(B + f"/ideas/{gg_idea['id']}/review-events")
+        pa_gg.drain_pending()
+
+    pa_gg.set_notifier(regen_during_send)
+    gg_res = pa_gg.send_due_followups()
+    gg_rev = _review_of(c_gg, gg_idea["id"])
+    ok(gg_res["sent"] == 0, "a send superseded by a new generation does not commit")
+    ok(gg_rev["generation"] >= 2, "the newer generation survives")
+    ok(gg_rev["state"] != "followup_sent", "a newer generation is not overwritten back to followup_sent")
+
+    # === Imported tokens fail closed ==================================== #
+    tok_root = tempfile.mkdtemp(prefix="preflight-tok-")
+    pa_t, c_t = _fresh(tok_root)
+
+    def _imported(idea_id, intent_extra, state="needs_context"):
+        intent = {"status": "requested", "correlation_token": "PF-ABCD", "question": "why?"}
+        intent.update(intent_extra)
+        return {"id": idea_id, "title": "imported", "review": {
+            "state": state, "input_revision": "sha256:aaa", "intent": intent}}
+
+    c_t.post(B + "/import", json={"mode": "merge", "ideas": [_imported("idea_tokmissing1", {})]})
+    r_missing = c_t.get(B + "/ideas/idea_tokmissing1").json()["review"]
+    ok(r_missing["intent"]["correlation_token"] is None, "imported token with no expiry is retired")
+    ok(r_missing["intent"]["status"] == "missing", "a retired imported token is not answerable")
+
+    c_t.post(B + "/import", json={"mode": "merge", "ideas": [_imported(
+        "idea_tokbadexp1", {"token_issued_at": "2026-01-01T00:00:00Z", "token_expires_at": "bad-date"})]})
+    r_bad = c_t.get(B + "/ideas/idea_tokbadexp1").json()["review"]
+    ok(r_bad["intent"]["correlation_token"] is None, "imported token with a malformed expiry is retired")
+
+    c_t.post(B + "/import", json={"mode": "merge", "ideas": [_imported(
+        "idea_tokexpired", {"token_issued_at": "2020-01-01T00:00:00Z",
+                            "token_expires_at": "2020-02-01T00:00:00Z"})]})
+    ok(c_t.get(B + "/ideas/idea_tokexpired").json()["review"]["intent"]["correlation_token"] is None,
+       "an already-expired imported token is retired")
+
+    # Answered history must block reuse of the same token as a new pending one.
+    hist_root = tempfile.mkdtemp(prefix="preflight-tok-hist-")
+    pa_hh, c_hh = _fresh(hist_root)
+    imp_res = c_hh.post(B + "/import", json={"mode": "replace", "ideas": [
+        {"id": "idea_histusedaa", "title": "old", "review": {
+            "state": "answered", "input_revision": "sha256:h",
+            "intent": {"status": "answered", "correlation_token": "PF-SAME",
+                       "answer": "prior", "answered_at": "2026-01-01T00:00:00Z"}}},
+        {"id": "idea_histnewaaa", "title": "new", "review": {
+            "state": "needs_context", "input_revision": "sha256:n",
+            "intent": {"status": "requested", "correlation_token": "PF-SAME", "question": "why?",
+                       "token_issued_at": "2026-07-01T00:00:00Z",
+                       "token_expires_at": "2099-01-01T00:00:00Z"}}},
+    ]}).json()
+    reused = c_hh.get(B + "/ideas/idea_histnewaaa").json()["review"]
+    ok(reused["intent"]["correlation_token"] is None,
+       "an imported token colliding with answered history is retired")
+    ok(imp_res.get("tokens_retired", 0) >= 1, "the import reports how many tokens it retired")
+    ok(c_hh.post(B + "/ideas/idea_histnewaaa/intent-answer",
+                 json={"token": "PF-SAME", "answer": "x"}).status_code >= 400,
+       "the collided token cannot be answered")
+    ok(c_hh.get(B + "/ideas/idea_histusedaa").json()["review"]["intent"]["answer"] == "prior",
+       "the historical answer is untouched")
+
+    # Two imported pending ideas sharing one token: at most one stays answerable.
+    dup_root = tempfile.mkdtemp(prefix="preflight-tok-dup-")
+    pa_d, c_d = _fresh(dup_root)
+    valid = {"token_issued_at": "2026-07-01T00:00:00Z", "token_expires_at": "2099-01-01T00:00:00Z"}
+    c_d.post(B + "/import", json={"mode": "replace", "ideas": [
+        _imported("idea_dupaaaaaa1", valid), _imported("idea_dupaaaaaa2", valid)]})
+    live_tokens = [
+        c_d.get(B + f"/ideas/{i}").json()["review"]["intent"]["correlation_token"]
+        for i in ("idea_dupaaaaaa1", "idea_dupaaaaaa2")
+    ]
+    ok(len([t for t in live_tokens if t]) <= 1, "duplicate imported tokens cannot both stay answerable")
+
+    # === Empty status configuration ===================================== #
+    st_root = tempfile.mkdtemp(prefix="preflight-status-")
+    pa_s, c_s = _fresh(st_root)
+    c_s.post(B + "/import", json={"mode": "replace", "config": {
+        "categories": [], "statuses": [], "templates": [], "source_types": []}, "ideas": []})
+    exposed = {s["id"] for s in c_s.get(B + "/config").json()["statuses"]}
+    ok(len(exposed) >= 1, "an empty status list is reseeded rather than left unusable")
+    made = c_s.post(B + "/ideas", json={"title": "Status check"}).json()
+    ok(made["status"] in exposed, "a created idea's status exists in the exposed configuration")
+    bogus = c_s.post(B + "/ideas", json={"title": "Bogus status", "status": "does-not-exist"}).json()
+    ok(bogus["status"] in exposed, "an unknown requested status falls back to a real one")
+    imported_status = c_s.post(B + "/import", json={"mode": "merge", "ideas": [
+        {"id": "idea_statusaaa1", "title": "imported", "status": "ghost"}]})
+    ok(imported_status.status_code == 200, "import with an unknown status succeeds")
+    ok(c_s.get(B + "/ideas/idea_statusaaa1").json()["status"] in exposed,
+       "an imported unknown status is coerced to a real one")
 
     # === Retention is actually invoked ================================== #
     ret_root = tempfile.mkdtemp(prefix="preflight-ret-")
