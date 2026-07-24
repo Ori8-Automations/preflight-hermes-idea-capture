@@ -1050,10 +1050,16 @@ def main() -> int:
     ok(pa_go.process_event(g_old)["status"] == "abandoned",
        "grace re-queue by a displaced owner is refused")
 
-    # === Cross-process exclusivity (independent module instances) ======== #
-    # These use SEPARATE module objects with their own _LOCK, so passing proves
-    # exclusivity does not rely on in-process thread locking.
-    xroot = tempfile.mkdtemp(prefix="preflight-xproc-")
+    # === Claim exclusivity does not depend on process-local locking ====== #
+    # Hermes runs ONE dashboard process with the plugin API imported once, so
+    # threaded concurrency inside that process is the supported contract (see the
+    # runtime scope correction on PR #3). Multi-process lost-update behaviour is
+    # explicitly NOT a v1.1 requirement and is not asserted here.
+    #
+    # What IS asserted: the claim primitive is a filesystem operation, so it stays
+    # exclusive even between module instances that share no lock. That is a
+    # property of the primitive, not of the lock, and it is worth pinning down.
+    xroot = tempfile.mkdtemp(prefix="preflight-claim-excl-")
     m_a, c_a2 = _independent(xroot)
     m_b, _ = _independent(xroot)
     m_c, _ = _independent(xroot)
@@ -1062,58 +1068,122 @@ def main() -> int:
     _enable(c_a2, grace_period_seconds=0)
     for mod in (m_a, m_b, m_c):
         mod.set_reviewer(reviewer_link_only)
-    c_a2.post(B + "/ideas", json={"title": "Xproc", "source_url": "https://example.com/xp"})
+    c_a2.post(B + "/ideas", json={"title": "Claim excl", "source_url": "https://example.com/xp"})
     x_id = m_a._iter_events(m_a.EVENTS_PENDING)[0]["event_id"]
 
-    # Two independent claimants: only one may win.
-    ok(m_a._claim_event(x_id) is not None, "the first independent claimant wins")
-    ok(m_b._claim_event(x_id) is None, "a second independent claimant is refused")
+    ok(m_a._claim_event(x_id) is not None, "the first claimant wins")
+    ok(m_b._claim_event(x_id) is None,
+       "a claimant sharing no lock with the winner is still refused (filesystem primitive)")
 
-    # Two independent reclaimers racing a newly published owner: the new owner
-    # must survive.
-    m_a._reclaim_stale_leases(max_lease_seconds=-1)     # reclaimer #1 restores pending
+    # A fresh lease is protected by its timestamp, so an unrelated recovery pass
+    # does not disturb a newly published owner.
+    m_a._reclaim_stale_leases(max_lease_seconds=-1)     # expire and restore to pending
     x_new = m_c._claim_event(x_id)                      # a NEW owner publishes
     ok(x_new is not None, "a new owner claims the reclaimed event")
-    m_b._reclaim_stale_leases()                         # reclaimer #2, normal TTL
+    m_b._reclaim_stale_leases()                         # normal TTL: lease is fresh
     ok(m_c._lease_is_mine(x_new) is True,
-       "a second independent reclaimer does not destroy a newly published lease")
+       "a recovery pass does not destroy a freshly published lease")
     ok((m_a.EVENTS_PROCESSING / f"{x_id}.json").exists(),
-       "the newly published lease is still present after a racing reclaimer")
+       "the freshly published lease is still present after a recovery pass")
 
-    # Two independent follow-up claimants sharing one data root.
-    froot = tempfile.mkdtemp(prefix="preflight-xproc-fu-")
-    m_p, c_p = _independent(froot)
-    m_q, _ = _independent(froot)
-    _enable(c_p, grace_period_seconds=0, followup_delivery="preflight")
-    m_p.set_reviewer(reviewer_link_only)
-    c_p.post(B + "/ideas", json={"title": "Xproc notify", "source_url": "https://example.com/xn"})
-    m_p.drain_pending()
-    x_sends = []
-    x_lock = threading.Lock()
+    # No lock file and no takeover marker should exist: that machinery was removed
+    # as unnecessary for the single-process Hermes contract, and the marker itself
+    # could strand an event across a restart.
+    ok(not hasattr(m_a, "_queue_lock"), "the cross-process queue lock is gone")
+    ok(not hasattr(m_a, "_RECLAIM_MARKER_SUFFIX"), "the reclaim takeover marker is gone")
+    ok(not list(m_a.EVENTS_DIR.glob(".queue.lock")), "no queue lock file is created")
+    ok(not list(m_a.EVENTS_PROCESSING.glob("*.reclaiming")), "no takeover markers are created")
 
-    def x_notifier(kind, payload):
-        with x_lock:
-            x_sends.append(payload)
+    # === Interrupted finalization must not resurrect completed work ====== #
+    # _move_event publishes the terminal record before deleting the processing
+    # lease. A crash between those leaves both; recovery must let the terminal
+    # record win.
+    for terminal_name in ("delivered", "failed"):
+        froot = tempfile.mkdtemp(prefix=f"preflight-interrupted-{terminal_name}-")
+        pa_f, c_f = _fresh(froot)
+        _enable(c_f, grace_period_seconds=0)
+        pa_f.set_reviewer(reviewer_link_only)
+        c_f.post(B + "/ideas", json={"title": "Interrupted", "source_url": "https://example.com/if"})
+        f_evt = pa_f._iter_events(pa_f.EVENTS_PENDING)[0]
+        f_id = f_evt["event_id"]
+        f_claim = pa_f._claim_event(f_id)
+        terminal_dir = pa_f.EVENTS_DELIVERED if terminal_name == "delivered" else pa_f.EVENTS_FAILED
+        # Crash shape: terminal record published, processing copy not yet removed.
+        finished = dict(f_claim)
+        finished["status"] = terminal_name
+        pa_f._atomic_write(terminal_dir / f"{f_id}.json", finished)
+        ok((pa_f.EVENTS_PROCESSING / f"{f_id}.json").exists(),
+           f"{terminal_name}: the crash shape has both records")
 
-    m_p.set_notifier(x_notifier)
-    m_q.set_notifier(x_notifier)
-    x_results = []
-    x_rlock = threading.Lock()
+        pa_f._reclaim_stale_leases(max_lease_seconds=-1)
+        ok((terminal_dir / f"{f_id}.json").exists(),
+           f"{terminal_name} record survives recovery (terminal wins)")
+        ok(not (pa_f.EVENTS_PENDING / f"{f_id}.json").exists(),
+           f"{terminal_name}: completed work is not resurrected to pending")
+        ok(not (pa_f.EVENTS_PROCESSING / f"{f_id}.json").exists(),
+           f"{terminal_name}: the redundant processing copy is cleared")
+        # And a subsequent drain must not re-review it.
+        before_state = _review_of(c_f, f_evt["idea_id"])
+        pa_f.drain_pending()
+        ok(_review_of(c_f, f_evt["idea_id"]) == before_state,
+           f"{terminal_name}: a later drain does not re-review completed work")
 
-    def x_send(mod):
-        out = mod.send_due_followups()
-        with x_rlock:
-            x_results.append(out)
+    # === Failed quarantine preserves the source ========================== #
+    qfroot = tempfile.mkdtemp(prefix="preflight-quarantine-fail-")
+    pa_qf, c_qf = _fresh(qfroot)
+    _enable(c_qf, grace_period_seconds=0)
+    bad_art = pa_qf.EVENTS_PROCESSING / "evt_qfailaaaaa1.json"
+    bad_art.write_text("{unparseable", "utf-8")
+    os.utime(bad_art, (0, 0))
+    real_replace = os.replace
+    os.replace = lambda a, b: (_ for _ in ()).throw(OSError("injected quarantine failure"))
+    try:
+        recovered_count = pa_qf._reclaim_stale_leases()
+    finally:
+        os.replace = real_replace
+    ok(bad_art.exists(), "a failed quarantine move leaves the source intact")
+    ok(len(list(pa_qf.EVENTS_QUARANTINE.glob("*.json"))) == 0, "nothing lands in quarantine on failure")
+    ok(recovered_count == 0, "a failed preservation is not counted as a recovery")
+    # And it succeeds once the move can work again.
+    ok(pa_qf._reclaim_stale_leases() >= 1, "the artifact is preserved on a later successful pass")
+    ok(len(list(pa_qf.EVENTS_QUARANTINE.glob("*.json"))) >= 1, "it now sits in quarantine")
 
-    x_threads = [threading.Thread(target=x_send, args=(mod,)) for mod in (m_p, m_q, m_p, m_q)]
-    for t in x_threads:
-        t.start()
-    for t in x_threads:
-        t.join()
-    ok(len(x_sends) == 1,
-       f"independent follow-up claimants produce exactly 1 physical send (got {len(x_sends)})")
-    ok(sum(r.get("sent", 0) for r in x_results) == 1,
-       "exactly one independent claimant commits the follow-up")
+    # === Imported timestamps: naive values fail closed, never 500 ======== #
+    nroot = tempfile.mkdtemp(prefix="preflight-naive-ts-")
+    pa_nv, c_nv = _fresh(nroot)
+    naive_res = c_nv.post(B + "/import", json={"mode": "merge", "ideas": [{
+        "id": "idea_naiveaaaa1", "title": "naive", "review": {
+            "state": "needs_context", "input_revision": "sha256:n",
+            "intent": {"status": "requested", "correlation_token": "PF-NAIV", "question": "why?",
+                       "token_issued_at": "2099-01-01T00:00:00",
+                       "token_expires_at": "2099-02-01T00:00:00"}}}]})
+    ok(naive_res.status_code == 200, "a timezone-less imported timestamp does not crash the endpoint")
+    naive_rev = c_nv.get(B + "/ideas/idea_naiveaaaa1").json()["review"]
+    ok(naive_rev["intent"]["correlation_token"] is None, "a timezone-less token is retired")
+    ok(c_nv.post(B + "/ideas/idea_naiveaaaa1/intent-answer",
+                 json={"token": "PF-NAIV", "answer": "x"}).status_code >= 400,
+       "a retired timezone-less token cannot be answered")
+    ok(pa_nv._parse_ts("2099-01-01T00:00:00") is None, "naive timestamps parse as unusable")
+    ok(pa_nv._parse_ts("2099-01-01T00:00:00Z") is not None, "UTC timestamps still parse")
+
+    # === Token-bearing 'missing' imports are vetted too ================== #
+    mroot = tempfile.mkdtemp(prefix="preflight-missing-status-")
+    pa_ms, c_ms = _fresh(mroot)
+    c_ms.post(B + "/import", json={"mode": "merge", "ideas": [{
+        "id": "idea_missingst1", "title": "missing status", "review": {
+            "state": "needs_context", "input_revision": "sha256:m",
+            "intent": {"status": "missing", "correlation_token": "PF-MISS", "question": "why?"}}}]})
+    ms_rev = c_ms.get(B + "/ideas/idea_missingst1").json()["review"]
+    ok(ms_rev["intent"]["correlation_token"] is None,
+       "a token carried under intent.status='missing' is vetted and retired")
+    ok(pa_ms._token_index().get("PF-MISS") is None,
+       "the retired token is no longer resolvable")
+    ok(c_ms.post(B + "/ideas/idea_missingst1/intent-answer",
+                 json={"token": "PF-MISS", "answer": "x"}).status_code >= 400,
+       "an unvetted 'missing' token cannot be answered")
+    # The answerable-status set is shared, so resolution and vetting cannot drift.
+    ok(pa_ms._ANSWERABLE_INTENT_STATUSES == {"requested", "missing"},
+       "token resolution and import vetting share one answerable-status set")
 
     # === Imported token timestamp ordering ============================== #
     for mode in ("merge", "replace"):

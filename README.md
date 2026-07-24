@@ -109,17 +109,23 @@ unchanged.
   (a short write is legal, and ignoring the byte count publishes truncated JSON
   while reporting success). Zero or stalled write progress fails the claim and
   leaves the pending copy intact.
-- **Cross-process serialization**: queue transitions hold a `flock` on
-  `events/.queue.lock` in addition to the in-process thread lock, because
-  separate worker processes do not share a `threading` lock. On a platform
-  without `fcntl` this degrades to thread-only serialization.
-- **Bounded recovery**: a live lease is never touched; an expired lease returns
-  to `pending` with its owner invalidated, but only after a **compare-and-swap**
-  proving the lease is still the exact one that was inspected — so a second
-  reclaimer cannot destroy a lease a new owner has since published. Recovery
-  decisions are themselves serialized by an exclusive takeover marker. A
-  malformed artifact is quarantined (never silently deleted) once provably not in
-  flight, so junk cannot block claims forever and nothing is lost.
+- **Concurrency contract**: Hermes runs **one** dashboard process (a single
+  `uvicorn.Server`, no worker-count override) with each plugin API imported once
+  into it, so *threads inside one process* are the supported contract and the
+  process-wide `RLock` is the serialization boundary. Concurrent drains are
+  covered; multi-process and multi-host writers are explicitly **not** claimed.
+  The claim primitive itself is a filesystem operation, so it stays exclusive
+  even without a lock — but that's a property of the primitive, not a
+  cross-process guarantee for everything else.
+- **Bounded recovery with explicit precedence**: recovery reconciles duplicate
+  states *before* reclaiming anything. A durable **terminal record
+  (`delivered`/`failed`) always wins** over a leftover `processing` lease — that
+  ordering is what stops an interrupted finalization from resurrecting completed
+  work on restart. Then: a live lease is never touched; an expired lease returns
+  to `pending` with its owner invalidated; a malformed artifact is quarantined
+  once provably not in flight. **A failed quarantine move leaves the source
+  exactly where it was and is not counted as a recovery** — "could not preserve"
+  never becomes deletion.
 - **Ownership binds every transition**: the lease is verified before the webhook
   send, before a failure write or retry, before a grace re-queue, before the
   missing-idea and stale-revision exits, and again atomically with the review
@@ -131,15 +137,19 @@ unchanged.
 - **Bounded retries** everywhere, including the no-route case, and **retention
   pruning** actually runs on each drain.
 - **Follow-up notification** is a claim → send → compare-and-swap transition
-  bound to (revision, generation, token), so concurrent senders produce one
-  physical message and an answer or newer generation arriving mid-flight is never
-  overwritten back to `followup_sent`. Delivery is **at-least-once**: each
-  message carries a stable `idempotency_key` so a sink that can deduplicate will
-  collapse a retry after a crash between send and acknowledgement.
-- **Imported tokens fail closed**: a token with missing, malformed, or elapsed
-  issuance/expiry is retired on import, as is one colliding with *any* retained
-  token — including answered history — so an import cannot resurrect a used
-  token as a new answerable one. A missing expiry never means "never expires".
+  bound to (revision, generation, token), so concurrent senders *within the
+  dashboard process* produce one physical message and an answer or newer
+  generation arriving mid-flight is never overwritten back to `followup_sent`.
+  Delivery is **at-least-once**: each message carries a stable `idempotency_key`
+  so a sink that can deduplicate will collapse a retry after a crash between send
+  and acknowledgement.
+- **Imported tokens fail closed**: a token with missing, malformed, out-of-order,
+  timezone-less, or elapsed issuance/expiry is retired on import, as is one
+  colliding with *any* retained token — including answered history — so an import
+  cannot resurrect a used token as a new answerable one. A missing expiry never
+  means "never expires", and vetting keys off whether a token is *answerable*
+  rather than off one status spelling, so `missing` is validated exactly like
+  `requested`. Malformed import data fails closed instead of raising a 500.
 
 ### Review, intent, and notifications
 
@@ -262,7 +272,12 @@ File-backed JSON, all under a single allow-listed data root:
     processing/           #   claimed by a worker (lease; reclaimed if abandoned)
     delivered/            #   reviewed or handed off successfully
     failed/               #   stale or exhausted retries
+    quarantine/           #   unusable artifacts kept for inspection, never deleted
 ```
+
+Recovery precedence, if a crash leaves an event in two places at once: a durable
+`delivered`/`failed` record always wins over a leftover `processing` lease, so
+completed work is never resurrected and re-reviewed.
 
 There is no background thread: the outbox is driven explicitly by
 `POST /review-events/drain` (and follow-ups by
