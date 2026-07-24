@@ -17,6 +17,7 @@ Usage:
 """
 
 import importlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -36,6 +37,33 @@ def ok(cond, msg):
     if not cond:
         raise AssertionError(msg)
     PASSED += 1
+
+
+_IND = [0]
+
+
+def _independent(root, **env):
+    """Load a SEPARATE plugin_api module object sharing one data root.
+
+    Each instance gets its own module-local ``_LOCK``, which is what an
+    independent worker process would have. Used to prove that queue exclusivity
+    does not depend on in-process thread locking.
+    """
+    os.environ["PREFLIGHT_IDEA_CAPTURE_DIR"] = root
+    for key in ("PREFLIGHT_REVIEW_WEBHOOK_URL", "PREFLIGHT_REVIEW_WEBHOOK_SECRET"):
+        os.environ.pop(key, None)
+    os.environ.update(env)
+    _IND[0] += 1
+    name = f"plugin_api_independent_{_IND[0]}"
+    spec = importlib.util.spec_from_file_location(name, str(DASHBOARD / "plugin_api.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module          # pydantic needs it importable by name
+    spec.loader.exec_module(module)
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(module.router, prefix="/api/plugins/preflight-idea-capture")
+    return module, TestClient(app)
 
 
 def _fresh(root, **env):
@@ -921,6 +949,222 @@ def main() -> int:
     ok(imported_status.status_code == 200, "import with an unknown status succeeds")
     ok(c_s.get(B + "/ideas/idea_statusaaa1").json()["status"] in exposed,
        "an imported unknown status is coerced to a real one")
+
+    # === Checked writes: no publish, no loss on short/zero progress ===== #
+    # os.write may legally write fewer bytes than requested. A loop that ignores
+    # progress can publish truncated JSON while reporting success.
+    real_write = os.write
+
+    def _write_case(inject):
+        wroot = tempfile.mkdtemp(prefix="preflight-write-")
+        pa_w, c_w = _fresh(wroot)
+        _enable(c_w, grace_period_seconds=0)
+        pa_w.set_reviewer(reviewer_link_only)
+        c_w.post(B + "/ideas", json={"title": "W", "source_url": "https://example.com/w"})
+        wid = pa_w._iter_events(pa_w.EVENTS_PENDING)[0]["event_id"]
+        os.write = inject
+        try:
+            claimed_w = pa_w._claim_event(wid)
+        except OSError:
+            claimed_w = None
+        finally:
+            os.write = real_write
+        return pa_w, wid, claimed_w
+
+    # Short write WITH progress: the write-all loop must complete it and publish
+    # valid, complete JSON.
+    pa_w, wid, claimed_w = _write_case(lambda fd, d: real_write(fd, d[:12]))
+    ok(claimed_w is not None, "a short write that makes progress still completes the claim")
+    published = pa_w._read_json(pa_w.EVENTS_PROCESSING / f"{wid}.json", None)
+    ok(isinstance(published, dict), "a short write publishes complete, parseable JSON")
+    ok(bool(published.get("lease_owner")) and bool(published.get("idea_id")),
+       "the published lease is not truncated")
+
+    # Zero progress: must fail the claim, publish nothing, and keep the event.
+    pa_w, wid, claimed_w = _write_case(lambda fd, d: 0)
+    ok(claimed_w is None, "a zero-progress write fails the claim")
+    ok(not (pa_w.EVENTS_PROCESSING / f"{wid}.json").exists(),
+       "a zero-progress write publishes no processing artifact")
+    ok((pa_w.EVENTS_PENDING / f"{wid}.json").exists(), "the pending copy survives a zero-progress write")
+    ok(pa_w._claim_event(wid) is not None, "the event is still claimable after a zero-progress write")
+
+    # Repeated partial progress then a stall: same guarantees.
+    stall = {"n": 0}
+
+    def stalling_write(fd, d):
+        stall["n"] += 1
+        return real_write(fd, d[:8]) if stall["n"] < 3 else 0
+
+    pa_w, wid, claimed_w = _write_case(stalling_write)
+    ok(claimed_w is None, "partial progress followed by a stall fails the claim")
+    ok(not (pa_w.EVENTS_PROCESSING / f"{wid}.json").exists(),
+       "a stalled write publishes no processing artifact")
+    ok((pa_w.EVENTS_PENDING / f"{wid}.json").exists(), "the event is not lost by a stalled write")
+    ok(not list(pa_w.EVENTS_PROCESSING.glob(f"*{pa_w._CLAIM_TMP_SUFFIX}")),
+       "a stalled write leaves no claim temp files")
+
+    # An unreconstructable artifact is quarantined, never silently deleted.
+    qroot = tempfile.mkdtemp(prefix="preflight-quarantine-")
+    pa_qq, c_qq = _fresh(qroot)
+    _enable(c_qq, grace_period_seconds=0)
+    junk_art = pa_qq.EVENTS_PROCESSING / "evt_unrecoveraa.json"
+    junk_art.write_text("{not valid json", "utf-8")
+    os.utime(junk_art, (0, 0))
+    ok(pa_qq._reclaim_stale_leases() >= 1, "an unreconstructable artifact is acted on")
+    ok(not junk_art.exists(), "it no longer blocks the claim path")
+    ok(len(list(pa_qq.EVENTS_QUARANTINE.glob("*.json"))) >= 1,
+       "it is quarantined for inspection rather than silently deleted")
+
+    # === Ownership-bound early exits ==================================== #
+    # A displaced owner must not publish a stale failure over new queue state.
+    for label, mutate in (
+        ("stale-revision", lambda cl, ii: cl.patch(B + f"/ideas/{ii}", json={"notes_markdown": "edited"})),
+        ("missing-idea", lambda cl, ii: cl.delete(B + f"/ideas/{ii}")),
+    ):
+        eroot = tempfile.mkdtemp(prefix="preflight-early-")
+        pa_ee, c_ee = _fresh(eroot)
+        _enable(c_ee, grace_period_seconds=0)
+        pa_ee.set_reviewer(reviewer_link_only)
+        e_idea = c_ee.post(B + "/ideas", json={"title": "Early", "source_url": "https://example.com/ee"}).json()
+        e_evt = pa_ee._iter_events(pa_ee.EVENTS_PENDING)[0]
+        e_old = pa_ee._claim_event(e_evt["event_id"])
+        pa_ee._reclaim_stale_leases(max_lease_seconds=-1)   # displace the owner
+        mutate(c_ee, e_idea["id"])
+        e_out = pa_ee.process_event(e_old)
+        ok(e_out["status"] == "abandoned", f"{label} exit is ownership-bound (abandoned)")
+        ok((pa_ee.EVENTS_PENDING / f"{e_evt['event_id']}.json").exists(),
+           f"{label} exit leaves the reclaimed pending entry intact")
+        ok(not (pa_ee.EVENTS_FAILED / f"{e_evt['event_id']}.json").exists(),
+           f"{label} exit does not publish a stale failure")
+
+    # Grace re-queue is ownership-bound too.
+    groot = tempfile.mkdtemp(prefix="preflight-grace-own-")
+    pa_go, c_go = _fresh(groot)
+    _enable(c_go, grace_period_seconds=0)
+    pa_go.set_reviewer(reviewer_link_only)
+    c_go.post(B + "/ideas", json={"title": "Grace own", "source_url": "https://example.com/go"})
+    g_evt = pa_go._iter_events(pa_go.EVENTS_PENDING)[0]
+    g_old = pa_go._claim_event(g_evt["event_id"])
+    g_old["not_before"] = "2099-01-01T00:00:00Z"          # make it not yet due
+    pa_go._reclaim_stale_leases(max_lease_seconds=-1)
+    ok(pa_go.process_event(g_old)["status"] == "abandoned",
+       "grace re-queue by a displaced owner is refused")
+
+    # === Cross-process exclusivity (independent module instances) ======== #
+    # These use SEPARATE module objects with their own _LOCK, so passing proves
+    # exclusivity does not rely on in-process thread locking.
+    xroot = tempfile.mkdtemp(prefix="preflight-xproc-")
+    m_a, c_a2 = _independent(xroot)
+    m_b, _ = _independent(xroot)
+    m_c, _ = _independent(xroot)
+    ok(m_a._LOCK is not m_b._LOCK and m_b._LOCK is not m_c._LOCK,
+       "the independent module instances really do have separate locks")
+    _enable(c_a2, grace_period_seconds=0)
+    for mod in (m_a, m_b, m_c):
+        mod.set_reviewer(reviewer_link_only)
+    c_a2.post(B + "/ideas", json={"title": "Xproc", "source_url": "https://example.com/xp"})
+    x_id = m_a._iter_events(m_a.EVENTS_PENDING)[0]["event_id"]
+
+    # Two independent claimants: only one may win.
+    ok(m_a._claim_event(x_id) is not None, "the first independent claimant wins")
+    ok(m_b._claim_event(x_id) is None, "a second independent claimant is refused")
+
+    # Two independent reclaimers racing a newly published owner: the new owner
+    # must survive.
+    m_a._reclaim_stale_leases(max_lease_seconds=-1)     # reclaimer #1 restores pending
+    x_new = m_c._claim_event(x_id)                      # a NEW owner publishes
+    ok(x_new is not None, "a new owner claims the reclaimed event")
+    m_b._reclaim_stale_leases()                         # reclaimer #2, normal TTL
+    ok(m_c._lease_is_mine(x_new) is True,
+       "a second independent reclaimer does not destroy a newly published lease")
+    ok((m_a.EVENTS_PROCESSING / f"{x_id}.json").exists(),
+       "the newly published lease is still present after a racing reclaimer")
+
+    # Two independent follow-up claimants sharing one data root.
+    froot = tempfile.mkdtemp(prefix="preflight-xproc-fu-")
+    m_p, c_p = _independent(froot)
+    m_q, _ = _independent(froot)
+    _enable(c_p, grace_period_seconds=0, followup_delivery="preflight")
+    m_p.set_reviewer(reviewer_link_only)
+    c_p.post(B + "/ideas", json={"title": "Xproc notify", "source_url": "https://example.com/xn"})
+    m_p.drain_pending()
+    x_sends = []
+    x_lock = threading.Lock()
+
+    def x_notifier(kind, payload):
+        with x_lock:
+            x_sends.append(payload)
+
+    m_p.set_notifier(x_notifier)
+    m_q.set_notifier(x_notifier)
+    x_results = []
+    x_rlock = threading.Lock()
+
+    def x_send(mod):
+        out = mod.send_due_followups()
+        with x_rlock:
+            x_results.append(out)
+
+    x_threads = [threading.Thread(target=x_send, args=(mod,)) for mod in (m_p, m_q, m_p, m_q)]
+    for t in x_threads:
+        t.start()
+    for t in x_threads:
+        t.join()
+    ok(len(x_sends) == 1,
+       f"independent follow-up claimants produce exactly 1 physical send (got {len(x_sends)})")
+    ok(sum(r.get("sent", 0) for r in x_results) == 1,
+       "exactly one independent claimant commits the follow-up")
+
+    # === Imported token timestamp ordering ============================== #
+    for mode in ("merge", "replace"):
+        oroot = tempfile.mkdtemp(prefix=f"preflight-order-{mode}-")
+        pa_o, c_o = _fresh(oroot)
+        c_o.post(B + "/import", json={"mode": mode, "ideas": [{
+            "id": "idea_orderaaaa1", "title": "bad order", "review": {
+                "state": "needs_context", "input_revision": "sha256:o",
+                "intent": {"status": "requested", "correlation_token": "PF-ORDR",
+                           "question": "why?",
+                           "token_issued_at": "2099-06-01T00:00:00Z",
+                           "token_expires_at": "2099-01-01T00:00:00Z"}}}]})
+        ordered = c_o.get(B + "/ideas/idea_orderaaaa1").json()["review"]
+        ok(ordered["intent"]["correlation_token"] is None,
+           f"expiry before issuance is retired on {mode} import")
+        ok(ordered["error_code"] == "imported_token_invalid_order",
+           f"{mode} import records the invalid-order reason")
+        ok(c_o.post(B + "/ideas/idea_orderaaaa1/intent-answer",
+                    json={"token": "PF-ORDR", "answer": "x"}).status_code >= 400,
+           f"an invalid-order token cannot be answered after {mode} import")
+
+    # Equal issuance and expiry describes a zero-length window: also retired.
+    eqroot = tempfile.mkdtemp(prefix="preflight-order-eq-")
+    pa_eq, c_eq = _fresh(eqroot)
+    c_eq.post(B + "/import", json={"mode": "merge", "ideas": [{
+        "id": "idea_ordereqaa1", "title": "equal", "review": {
+            "state": "needs_context", "input_revision": "sha256:e",
+            "intent": {"status": "requested", "correlation_token": "PF-EQAL", "question": "why?",
+                       "token_issued_at": "2099-01-01T00:00:00Z",
+                       "token_expires_at": "2099-01-01T00:00:00Z"}}}]})
+    ok(c_eq.get(B + "/ideas/idea_ordereqaa1").json()["review"]["intent"]["correlation_token"] is None,
+       "a zero-length token window is retired")
+
+    # === Every mutation path preserves the status invariant ============= #
+    proot = tempfile.mkdtemp(prefix="preflight-patch-status-")
+    pa_p2, c_p2 = _fresh(proot)
+    exposed_p = {s["id"] for s in c_p2.get(B + "/config").json()["statuses"]}
+    p_idea = c_p2.post(B + "/ideas", json={"title": "Patch status"}).json()
+    patched = c_p2.patch(B + f"/ideas/{p_idea['id']}", json={"status": "ghost"}).json()
+    ok(patched["status"] in exposed_p, "PATCH cannot set a status outside the configuration")
+    real_status = sorted(exposed_p)[0]
+    kept = c_p2.patch(B + f"/ideas/{p_idea['id']}", json={"status": real_status}).json()
+    ok(kept["status"] == real_status, "PATCH still accepts a real status")
+    # All three mutation paths agree.
+    created_p = c_p2.post(B + "/ideas", json={"title": "C", "status": "nope"}).json()
+    c_p2.post(B + "/import", json={"mode": "merge", "ideas": [
+        {"id": "idea_statusinv1", "title": "I", "status": "nope"}]})
+    imported_p = c_p2.get(B + "/ideas/idea_statusinv1").json()
+    ok(created_p["status"] in exposed_p and imported_p["status"] in exposed_p
+       and patched["status"] in exposed_p,
+       "create, import, and patch all leave a status present in the exposed configuration")
 
     # === Retention is actually invoked ================================== #
     ret_root = tempfile.mkdtemp(prefix="preflight-ret-")

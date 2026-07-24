@@ -30,6 +30,11 @@ import re
 import socket
 import threading
 import uuid
+
+try:  # POSIX advisory locking — present on Linux/macOS, absent on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -58,6 +63,12 @@ EVENTS_PENDING = EVENTS_DIR / "pending"
 EVENTS_PROCESSING = EVENTS_DIR / "processing"  # claimed-but-not-finished lease
 EVENTS_DELIVERED = EVENTS_DIR / "delivered"
 EVENTS_FAILED = EVENTS_DIR / "failed"
+# Artifacts that cannot be safely reconstructed or discarded are moved here for
+# an operator to inspect. Never silently deleted — that would be work loss.
+EVENTS_QUARANTINE = EVENTS_DIR / "quarantine"
+# Cross-process advisory lock file guarding queue transitions. A thread lock
+# alone is insufficient: separate worker processes do not share it.
+QUEUE_LOCK_FILE = EVENTS_DIR / ".queue.lock"
 
 # One writer at a time is plenty for a single-user capture tool and avoids
 # torn writes to the JSON files.
@@ -71,6 +82,8 @@ _EVENT_ID_RE = re.compile(r"^evt_[a-z0-9]{6,32}$")
 # Suffix for in-flight claim temp files (see _claim_event). Deliberately not
 # matched by the evt_*.json glob so a temp file is never mistaken for a lease.
 _CLAIM_TMP_SUFFIX = ".claim-tmp"
+# Exclusive marker held by whichever reclaimer owns a recovery decision.
+_RECLAIM_MARKER_SUFFIX = ".reclaiming"
 # Correlation tokens are human-readable and non-authoritative on their own; a
 # write always requires server-side resolution in addition to the token. The
 # alphabet drops easily-confused characters (0/O, 1/I).
@@ -256,6 +269,74 @@ def _safe_path(base: Path, *parts: str) -> Path:
     return target
 
 
+def _write_all(fd: int, payload: bytes) -> None:
+    """Write every byte of ``payload`` to ``fd`` or raise.
+
+    ``os.write`` may legally write fewer bytes than requested. Ignoring the
+    return value lets a short write publish truncated JSON while reporting
+    success, so progress is checked on every iteration and any zero/negative
+    advance is treated as a write failure rather than silently accepted.
+    """
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        n = os.write(fd, view[written:])
+        if n is None or n <= 0:
+            raise OSError(
+                f"short write: no progress after {written} of {len(view)} bytes"
+            )
+        written += n
+    if written != len(view):  # defensive; loop guarantees equality
+        raise OSError(f"short write: {written} of {len(view)} bytes")
+
+
+# Cross-process queue serialization. Ordering is always: thread lock first, then
+# the file lock, so nesting can never deadlock. A per-thread depth counter makes
+# the file lock reentrant alongside the RLock.
+_LOCK_DEPTH = threading.local()
+
+
+class _QueueLock:
+    """Reentrant thread + cross-process advisory lock for queue transitions.
+
+    ``_LOCK`` alone only serializes threads inside one interpreter. Independent
+    worker processes sharing a data root need a filesystem-level lock, which is
+    what the ``flock`` here provides. Falls back to thread-only serialization on
+    platforms without ``fcntl``, and says so rather than pretending otherwise.
+    """
+
+    def __enter__(self):
+        _LOCK.acquire()
+        depth = getattr(_LOCK_DEPTH, "n", 0)
+        _LOCK_DEPTH.n = depth + 1
+        if depth == 0 and fcntl is not None:
+            try:
+                EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+                self._fd = os.open(str(QUEUE_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(self._fd, fcntl.LOCK_EX)
+            except OSError:
+                self._fd = None
+        else:
+            self._fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+            self._fd = None
+        _LOCK_DEPTH.n = getattr(_LOCK_DEPTH, "n", 1) - 1
+        _LOCK.release()
+        return False
+
+
+def _queue_lock() -> _QueueLock:
+    """Acquire the queue lock (thread + cross-process)."""
+    return _QueueLock()
+
+
 def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
@@ -274,8 +355,8 @@ def _atomic_write(path: Path, data: Any) -> None:
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)  # durable file bytes before the rename
+            _write_all(fd, payload.encode("utf-8"))
+            os.fsync(fd)  # durable bytes only after a complete, checked write
         finally:
             os.close(fd)
         os.replace(str(tmp), str(path))  # atomic on POSIX
@@ -300,7 +381,8 @@ def _ensure_layout() -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     IDEAS_DIR.mkdir(parents=True, exist_ok=True)
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    for d in (EVENTS_PENDING, EVENTS_PROCESSING, EVENTS_DELIVERED, EVENTS_FAILED):
+    for d in (EVENTS_PENDING, EVENTS_PROCESSING, EVENTS_DELIVERED, EVENTS_FAILED,
+              EVENTS_QUARANTINE):
         d.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         _atomic_write(
@@ -859,6 +941,11 @@ def _vet_imported_review(review: Optional[Dict[str, Any]], seen_tokens: set) -> 
         if issued is None or expires is None:
             _retire_imported_token(review, "imported_token_missing_timestamps")
             return review
+        # Ordering matters as much as parseability: expiry at or before issuance
+        # describes a window that never existed, even if both are in the future.
+        if expires <= issued:
+            _retire_imported_token(review, "imported_token_invalid_order")
+            return review
         if _now_dt() > expires:
             _retire_imported_token(review, "imported_token_expired")
             return review
@@ -1259,7 +1346,7 @@ def send_due_followups(claim_ttl_seconds: int = 300) -> Dict[str, Any]:
 
     # ---- 1. claim, durably, before releasing the lock -------------------- #
     claimed: List[Dict[str, Any]] = []
-    with _LOCK:
+    with _queue_lock():
         for path in sorted(IDEAS_DIR.glob("idea_*.json")):
             idea = _read_json(path, None)
             if not isinstance(idea, dict):
@@ -1322,7 +1409,7 @@ def send_due_followups(claim_ttl_seconds: int = 300) -> Dict[str, Any]:
 
     if not ok:
         # Release the claims so a working sink can retry immediately.
-        with _LOCK:
+        with _queue_lock():
             for stub in claimed:
                 idea = _read_json(_idea_path(stub["id"]), None)
                 if not isinstance(idea, dict):
@@ -1345,7 +1432,7 @@ def send_due_followups(claim_ttl_seconds: int = 300) -> Dict[str, Any]:
     committed = 0
     for stub in claimed:
         expected = _followup_identity(stub.get("review") or {})
-        with _LOCK:
+        with _queue_lock():
             idea = _read_json(_idea_path(stub["id"]), None)
             if not isinstance(idea, dict):
                 continue
@@ -1528,11 +1615,13 @@ def _claim_event(event_id: str) -> Optional[Dict[str, Any]]:
     ev["lease_owner"] = "own_" + uuid.uuid4().hex[:16]
 
     # Step 1: fully-formed, fsynced, and not yet reachable at the claim path.
+    # The write is checked byte-for-byte — a short write must fail the claim, not
+    # publish truncated JSON while reporting success.
     tmp = dst.with_suffix(f".{uuid.uuid4().hex}{_CLAIM_TMP_SUFFIX}")
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(fd, json.dumps(ev, indent=2, ensure_ascii=False).encode("utf-8"))
+            _write_all(fd, json.dumps(ev, indent=2, ensure_ascii=False).encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -1611,6 +1700,23 @@ def _sweep_claim_temps(max_age_seconds: int = 900) -> int:
     return removed
 
 
+def _quarantine_artifact(path: Path, reason: str) -> None:
+    """Move an unusable queue artifact aside for inspection instead of deleting.
+
+    Silent deletion of an artifact that cannot be reconstructed is permanent work
+    loss, so anything undecidable ends up here with its reason recorded.
+    """
+    EVENTS_QUARANTINE.mkdir(parents=True, exist_ok=True)
+    dest = EVENTS_QUARANTINE / f"{path.stem}.{uuid.uuid4().hex[:8]}.{reason}.json"
+    try:
+        os.replace(str(path), str(dest))
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def _reclaim_stale_leases(max_lease_seconds: int = 900) -> int:
     """Return events abandoned mid-processing to ``pending``, and bound junk.
 
@@ -1630,56 +1736,83 @@ def _reclaim_stale_leases(max_lease_seconds: int = 900) -> int:
         return 0
 
     for path in sorted(EVENTS_PROCESSING.glob("evt_*.json")):
-        ev = _read_json(path, None)
-        stamped = _parse_ts(ev.get("lease_at")) if isinstance(ev, dict) else None
-
-        if stamped is not None:
-            if (_now_dt() - stamped).total_seconds() <= max_lease_seconds:
-                continue  # valid live lease — never resurrect
-            ev["status"] = "pending"
-            ev["last_error"] = "recovered from stale lease"
-            ev.pop("lease_owner", None)  # invalidate the displaced owner
-            _move_event(ev, EVENTS_PENDING)
-            recovered += 1
-            continue
-
-        # Malformed or unstamped: only actionable once it is provably not a
-        # claim in flight. Age is taken from the filesystem because the content
-        # is untrustworthy.
+        event_id = path.stem
+        # Exclusive takeover marker: only one reclaimer may act on this event,
+        # across threads AND processes. Without it, two reclaimers can both
+        # inspect one expired lease and the second can delete a lease a brand-new
+        # owner has since published.
+        marker = EVENTS_PROCESSING / f"{event_id}{_RECLAIM_MARKER_SUFFIX}"
         try:
-            age = _now_dt().timestamp() - path.stat().st_mtime
+            mfd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(mfd)
+        except FileExistsError:
+            continue          # another reclaimer owns this decision
         except OSError:
             continue
-        if age <= max(max_lease_seconds, 0):
-            continue  # possibly mid-claim; leave it alone
 
-        event_id = path.stem
-        pending_copy = EVENTS_PENDING / f"{event_id}.json"
-        if pending_copy.exists():
-            # The pre-claim copy survived, so the queue entry is not lost —
-            # drop the unusable artifact and let the pending copy be claimed.
-            try:
-                path.unlink()
+        try:
+            observed = _read_json(path, None)
+            stamped = _parse_ts(observed.get("lease_at")) if isinstance(observed, dict) else None
+
+            if stamped is not None:
+                if (_now_dt() - stamped).total_seconds() <= max_lease_seconds:
+                    continue  # valid live lease — never resurrect
+                # CAS: prove we are still replacing the exact lease we inspected.
+                # If a newer owner republished between our read and now, abort.
+                current = _read_json(path, None)
+                if not isinstance(current, dict):
+                    continue
+                if (current.get("lease_owner") != observed.get("lease_owner")
+                        or current.get("lease_at") != observed.get("lease_at")):
+                    continue  # a newer owner published; leave it alone
+                ev = dict(current)
+                ev["status"] = "pending"
+                ev["last_error"] = "recovered from stale lease"
+                ev.pop("lease_owner", None)  # invalidate the displaced owner
+                ev.pop("lease_at", None)
+                _move_event(ev, EVENTS_PENDING)
                 recovered += 1
-            except OSError:
-                pass
-            continue
-        # No pending copy: reconstruct a minimal pending entry from the id so
-        # the work is retried rather than stranded, and record why.
-        salvage = ev if isinstance(ev, dict) else {}
-        salvage.setdefault("event_id", event_id)
-        salvage["status"] = "pending"
-        salvage["last_error"] = "recovered from malformed claim artifact"
-        salvage.pop("lease_owner", None)
-        salvage.pop("lease_at", None)
-        if _EVENT_ID_RE.match(event_id) and salvage.get("idea_id"):
-            _move_event(salvage, EVENTS_PENDING)
-        else:
+                continue
+
+            # Malformed or unstamped: only actionable once it is provably not a
+            # claim in flight. Age is taken from the filesystem because the
+            # content is untrustworthy.
             try:
-                path.unlink()
+                age = _now_dt().timestamp() - path.stat().st_mtime
+            except OSError:
+                continue
+            if age <= max(max_lease_seconds, 0):
+                continue  # possibly mid-claim; leave it alone
+
+            pending_copy = EVENTS_PENDING / f"{event_id}.json"
+            if pending_copy.exists():
+                # The authoritative pre-claim copy survived, so the queue entry
+                # is not lost. Quarantine the unusable artifact (never a silent
+                # delete) and let the pending copy be claimed.
+                _quarantine_artifact(path, "malformed_claim_artifact")
+                recovered += 1
+                continue
+
+            # No authoritative pending copy. Only reconstruct when the salvaged
+            # content is sufficient to identify real work; otherwise quarantine
+            # so an operator can see it. Deleting here would be permanent loss.
+            salvage = dict(observed) if isinstance(observed, dict) else {}
+            salvage.setdefault("event_id", event_id)
+            salvage["status"] = "pending"
+            salvage["last_error"] = "recovered from malformed claim artifact"
+            salvage.pop("lease_owner", None)
+            salvage.pop("lease_at", None)
+            if (_EVENT_ID_RE.match(event_id) and salvage.get("idea_id")
+                    and salvage.get("idea_revision")):
+                _move_event(salvage, EVENTS_PENDING)
+            else:
+                _quarantine_artifact(path, "unreconstructable_claim_artifact")
+            recovered += 1
+        finally:
+            try:
+                marker.unlink()
             except OSError:
                 pass
-        recovered += 1
     return recovered
 
 
@@ -1749,7 +1882,7 @@ def _retry_or_fail(event: Dict[str, Any], error: str, max_attempts: int) -> Dict
     Ownership-bound: a worker that lost its lease may not re-queue or fail an
     event that another owner now holds.
     """
-    with _LOCK:
+    with _queue_lock():
         if not _lease_is_mine(event):
             return _abandon(event, "lease lost before retry/fail")
         event["last_error"] = error
@@ -1779,11 +1912,14 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     event = dict(event)
 
     # Grace period: not yet due → return it to pending untouched (no attempt
-    # burned, so a premature drain can't exhaust the retry budget).
+    # burned, so a premature drain can't exhaust the retry budget). Still
+    # ownership-bound: a displaced owner may not re-queue someone else's event.
     if not _event_is_due(event):
-        event["status"] = "pending"
-        with _LOCK:
-            _move_event(event, EVENTS_PENDING)
+        with _queue_lock():
+            if not _lease_is_mine(event):
+                return _abandon(event, "lease lost before grace re-queue")
+            event["status"] = "pending"
+            _move_event(event, EVENTS_PENDING, owned=True)
         return event
 
     event["attempts"] = int(event.get("attempts", 0)) + 1
@@ -1791,18 +1927,22 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
     idea = _read_json(_idea_path(event["idea_id"]), None)
     if not isinstance(idea, dict):
-        event["status"] = "failed"
-        event["last_error"] = "idea not found"
-        with _LOCK:
-            _move_event(event, EVENTS_FAILED)
+        with _queue_lock():
+            if not _lease_is_mine(event):
+                return _abandon(event, "lease lost before missing-idea failure")
+            event["status"] = "failed"
+            event["last_error"] = "idea not found"
+            _move_event(event, EVENTS_FAILED, owned=True)
         return event
 
     # Stale guard: the idea moved on since the event was enqueued.
     if _input_revision(idea) != event.get("idea_revision"):
-        event["status"] = "failed"
-        event["last_error"] = "stale event (idea revised)"
-        with _LOCK:
-            _move_event(event, EVENTS_FAILED)
+        with _queue_lock():
+            if not _lease_is_mine(event):
+                return _abandon(event, "lease lost before stale-revision failure")
+            event["status"] = "failed"
+            event["last_error"] = "stale event (idea revised)"
+            _move_event(event, EVENTS_FAILED, owned=True)
         return event
 
     # --- external reviewer via authenticated webhook ---------------------- #
@@ -1817,7 +1957,7 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
         if ok:
             # The external reviewer will post results back through the normal
             # review API; the event's job ends at successful hand-off.
-            with _LOCK:
+            with _queue_lock():
                 if not _lease_is_mine(event):
                     return _abandon(event, "lease lost after webhook delivery")
                 event["status"] = "delivered"
@@ -1843,7 +1983,7 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — bound any adapter failure
         # A failure is still a write and a retry, so it is ownership-bound too:
         # a displaced owner may not mark another owner's event failed.
-        with _LOCK:
+        with _queue_lock():
             if not _lease_is_mine(event):
                 return _abandon(event, "lease lost before failure write")
             _record_attempt_failure(event, idea, "reviewer_error")
@@ -1854,7 +1994,7 @@ def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
     # Ownership check, apply, and the queue transition happen inside one
     # lock-bound critical section, so no reclaim can interleave between
     # "we still own it" and "the result is committed".
-    with _LOCK:
+    with _queue_lock():
         if not _lease_is_mine(event):
             return _abandon(event, "lease lost during review")
         try:
@@ -1917,13 +2057,14 @@ def _build_review_from_result(
 def drain_pending(limit: int = 100) -> List[Dict[str, Any]]:
     """Claim and process up to ``limit`` due pending events.
 
-    Each event is claimed by an atomic rename into ``processing`` before it is
-    worked, so concurrent drains never double-process one event. Events still
-    inside their grace period are left alone. Retention is pruned on the way out.
+    Each event is exclusively claimed into ``processing`` before it is worked
+    (see ``_claim_event``), so concurrent drains — in this process or another —
+    never double-process one event. Events still inside their grace period are
+    left alone. Retention is pruned on the way out.
     """
     _reclaim_stale_leases()
     processed: List[Dict[str, Any]] = []
-    with _LOCK:
+    with _queue_lock():
         candidates = [
             ev for ev in _iter_events(EVENTS_PENDING) if _event_is_due(ev)
         ][:limit]
@@ -2373,6 +2514,10 @@ async def update_idea(idea_id: str, body: IdeaPatch) -> Dict[str, Any]:
 
         if "priority" in changes and changes["priority"] not in _PRIORITIES:
             changes["priority"] = idea.get("priority", "")
+        # Same invariant as create/import: every mutation path must leave the
+        # status present in the exposed configuration.
+        if "status" in changes and changes["status"] is not None:
+            changes["status"] = _valid_status(changes["status"])
         if "source_type" in changes:
             changes["source_type"] = _clean_source_type(changes["source_type"])
         if "tags" in changes and changes["tags"] is not None:

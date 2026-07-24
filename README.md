@@ -99,25 +99,35 @@ unchanged.
   that runs too early burns no retry budget.
 - **Single-consumer claims**: a claim is published only once it is already
   complete. The full lease (owner + timestamp) is written to a unique temp file
-  and `fsync`'d, then `os.link()`'d onto the `processing/` path — `link()` fails
-  with `EEXIST`, making it a no-clobber atomic publish with exactly one winner.
-  Two primitives are deliberately *not* used: plain `rename` (it replaces an
-  existing destination, so it cannot express "claim only if unclaimed") and
-  `O_EXCL`-create-then-write (it publishes an *empty* file first, so a crash
-  between the two steps leaves a malformed lease that blocks every future claim
-  and strands the event). Because the published file is complete, there is no
-  window in which a concurrent reclaim can see an unstamped lease and resurrect
-  an event another worker holds.
+  with a **checked write-all loop** and `fsync`'d, then `os.link()`'d onto the
+  `processing/` path — `link()` fails with `EEXIST`, making it a no-clobber
+  atomic publish with exactly one winner. Three things are deliberately *not*
+  done: plain `rename` as the claim (it replaces an existing destination, so it
+  cannot express "claim only if unclaimed"); `O_EXCL`-create-then-write (it
+  publishes an *empty* file first, so a crash between the steps leaves a
+  malformed lease that blocks every future claim); and an unchecked `os.write`
+  (a short write is legal, and ignoring the byte count publishes truncated JSON
+  while reporting success). Zero or stalled write progress fails the claim and
+  leaves the pending copy intact.
+- **Cross-process serialization**: queue transitions hold a `flock` on
+  `events/.queue.lock` in addition to the in-process thread lock, because
+  separate worker processes do not share a `threading` lock. On a platform
+  without `fcntl` this degrades to thread-only serialization.
 - **Bounded recovery**: a live lease is never touched; an expired lease returns
-  to `pending` with its owner invalidated; a malformed or incomplete claim
-  artifact is quarantined once it is provably not in flight, so junk can never
-  block claims forever. Orphaned claim temp files are swept.
-- **Ownership binds every side effect**: the lease is verified before the webhook
-  send, before a failure write or retry, and again atomically with the review
-  apply and final queue transition. A displaced owner cannot send, apply, retry,
-  fail, or delete another owner's queue state.
+  to `pending` with its owner invalidated, but only after a **compare-and-swap**
+  proving the lease is still the exact one that was inspected — so a second
+  reclaimer cannot destroy a lease a new owner has since published. Recovery
+  decisions are themselves serialized by an exclusive takeover marker. A
+  malformed artifact is quarantined (never silently deleted) once provably not in
+  flight, so junk cannot block claims forever and nothing is lost.
+- **Ownership binds every transition**: the lease is verified before the webhook
+  send, before a failure write or retry, before a grace re-queue, before the
+  missing-idea and stale-revision exits, and again atomically with the review
+  apply and finalization. A displaced owner cannot send, apply, retry, fail, or
+  delete another owner's queue state.
 - **Crash semantics**: dying mid-claim costs a delay, never a double review and
-  never a stranded event. Writes are `fsync`'d with collision-safe temp names.
+  never a stranded or deleted event. Writes are `fsync`'d with collision-safe
+  temp names.
 - **Bounded retries** everywhere, including the no-route case, and **retention
   pruning** actually runs on each drain.
 - **Follow-up notification** is a claim → send → compare-and-swap transition
