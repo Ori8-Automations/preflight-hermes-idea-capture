@@ -68,21 +68,55 @@ No dummy data: Preflight starts with an empty category tree, a set of sensible
 default statuses, a few generic starter templates, and a generic list of source
 types — all editable.
 
-## Planned v1.1 — Context review and intent capture
+## v1.1 — Context review and intent capture
 
-The proposed next minor release adds an optional event-driven review flow for
-rough ideas and link-only captures. It is designed to summarize public source
-material, suggest classification, and ask the operator one concise follow-up
-when the reason for saving an item is missing.
+v1.1 adds an optional, event-driven review flow for rough ideas and link-only
+captures. It summarizes public source material, suggests a classification, and
+asks the operator one concise follow-up when the reason for saving an item is
+missing — without ever turning a thought into active work.
 
-The proposal preserves Preflight's existing boundary: review may enrich an idea,
-but it may not automatically create projects, promote work to Kanban, archive or
-delete items, or dispatch agents. Idea capture also remains independent from
-review availability.
+**This release ships the backend contract.** The feature is **off by default**
+and stays fully inert until an operator enables it (`PATCH
+/config/context-review`) *and* installs a reviewer. Preflight is completely
+functional with it disabled, and existing v1.0 data loads unchanged.
+
+What's implemented:
+
+- A **durable local outbox** (`<DATA_ROOT>/events/{pending,delivered,failed}`).
+  Idea persistence stays authoritative and completes first; enqueue is
+  best-effort and never blocks or fails capture.
+- An **idempotent, revision-bound event** per capture (idempotency key =
+  `event_type + idea_id + input_revision`). Duplicate delivery creates no
+  duplicate reviews or messages, and a **stale event can't overwrite** a review
+  recorded for newer idea bytes.
+- A **bounded review envelope** stored alongside the idea (never blended into
+  `notes_markdown`). Source facts, agent suggestions, and operator intent stay
+  in separate sub-objects.
+- **Correlation-token intent capture** with fail-closed semantics: malformed,
+  used, mismatched, ambiguous, or superseded-revision tokens are all refused;
+  replaying the same answer is idempotent; `not sure anymore` is a valid answer.
+- **Authority limits enforced in code**: a reviewer may only write the review
+  envelope and append a review/intent timeline note. It cannot change the
+  operator-authored title, summary, notes, category, status, priority, tags,
+  archive, or promotion state, and no raw page bodies, cookies, or secrets are
+  persisted.
+- **SSRF-safe source-URL validation** (`validate_public_url`) rejecting
+  loopback, private, link-local, reserved, IPv4-mapped, and cloud-metadata
+  destinations, plus **HMAC-SHA256 webhook signing** helpers.
+- A **fixture reviewer hook** (`set_reviewer`) so the whole path is testable
+  offline. No live webhook delivery is wired on by default; enabling live
+  delivery to Hermes additionally requires granting the plugin network access
+  (`permissions.network`), which stays `false` in this package.
+
+Not yet implemented: the **review UI** (badges, source/intent/agent sections,
+`Review again` / `Answer` / `Dismiss` controls). The dashboard bundle
+(`dist/index.js`) is a prebuilt artifact with no source in this repo, so the UI
+is deferred to a follow-up once the frontend source is available. All review
+state is exposed via the API below in the meantime.
 
 See the [v1.1 context review and intent capture specification](docs/v1.1-context-review-and-intent-capture.md)
-for the event model, security boundary, notification budget, acceptance criteria,
-and implementation handoff.
+for the full event model, security boundary, notification budget, and
+acceptance criteria.
 
 ## Requirements
 
@@ -144,9 +178,14 @@ File-backed JSON, all under a single allow-listed data root:
 ```
 <DATA_ROOT>/
   categories.json         # category tree + custom status/source/template definitions
+                          #   + context_review settings
   ideas/
     idea_<id>.json        # one file per idea
   attachments/            # reserved for future use
+  events/                 # v1.1 review outbox (created lazily)
+    pending/              #   enqueued, awaiting a reviewer
+    delivered/            #   reviewed successfully
+    failed/               #   stale or exhausted retries
 ```
 
 Default `DATA_ROOT` is `$HERMES_HOME/idea-capture` (falling back to
@@ -191,9 +230,15 @@ with **Import** (merge or replace).
   "updated_at": "…",
   "promoted_to_kanban": null,
   "archived": false,
-  "archived_at": null
+  "archived_at": null,
+  "review": null
 }
 ```
+
+`review` is `null` until v1.1 context review runs for the idea. When present it
+is a bounded envelope with `state`, `input_revision`, `reviewer_version`, and
+separate `source` / `classification` / `intent` sub-objects — see the
+[v1.1 spec](docs/v1.1-context-review-and-intent-capture.md#record-model).
 
 ## API (mounted at `/api/plugins/preflight-idea-capture`)
 
@@ -214,6 +259,12 @@ with **Import** (merge or replace).
 | POST | `/ideas/{id}/promote-draft` | Generate a Kanban card draft (draft only) |
 | GET | `/export` | Export the full dataset (config + all ideas) as JSON |
 | POST | `/import` | Import a dataset (`mode`: `merge` or `replace`) |
+| PATCH | `/config/context-review` | Toggle/configure v1.1 review (off by default) |
+| GET | `/review-events` | Outbox diagnostics (pending/delivered/failed; no secrets) |
+| POST | `/ideas/{id}/review-events` | Enqueue/re-enqueue review for the current revision |
+| GET | `/ideas/{id}/review` | Return the review envelope (may be `null`) |
+| POST | `/ideas/{id}/intent-answer` | Append operator intent, bound to a correlation token |
+| POST | `/ideas/{id}/review-dismiss` | Dismiss the follow-up without changing disposition |
 
 ### Export / import format
 
@@ -268,14 +319,18 @@ A self-contained smoke test exercises static checks plus the full API surface
 (health, config, category/subcategory/template/idea CRUD, source-type filter,
 updates, export/import round-trip, custom source-type restore into a fresh data
 root, source URL scheme safety, mobile stylesheet checks, promote-draft with `{}` **and** with no body,
-bad-id rejection, and path-traversal safety):
+bad-id rejection, and path-traversal safety). A second suite
+(`tests/review_test.py`) covers the v1.1 acceptance matrix — capture durability,
+the durable outbox, review correctness, intent-token correlation, notification
+budgeting, SSRF source safeguards, HMAC transport, authority limits, and v1.0
+compatibility:
 
 ```bash
 ./tests/run_tests.sh
 ```
 
-It runs `py_compile`, `node --check`, and a FastAPI `TestClient` suite against a
-temporary `PREFLIGHT_IDEA_CAPTURE_DIR`.
+It runs `py_compile`, `node --check`, and two FastAPI `TestClient` suites against
+temporary `PREFLIGHT_IDEA_CAPTURE_DIR`s.
 
 The runner auto-selects a Python that has the test deps: it prefers `$PYTHON`,
 then an active `$VIRTUAL_ENV`, then `/opt/hermes/.venv/bin/python`, then

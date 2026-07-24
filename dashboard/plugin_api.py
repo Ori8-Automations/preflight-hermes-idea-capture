@@ -21,14 +21,18 @@ Routes are mounted by Hermes at:  /api/plugins/preflight-idea-capture/
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
+import socket
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
@@ -46,6 +50,14 @@ IDEAS_DIR = DATA_ROOT / "ideas"
 ATTACHMENTS_DIR = DATA_ROOT / "attachments"
 CONFIG_FILE = DATA_ROOT / "categories.json"
 
+# v1.1 context-review outbox. Idea persistence stays authoritative; review
+# events are enqueued here and drained by an out-of-band sender. Nothing in
+# this tree is ever required for capture to succeed.
+EVENTS_DIR = DATA_ROOT / "events"
+EVENTS_PENDING = EVENTS_DIR / "pending"
+EVENTS_DELIVERED = EVENTS_DIR / "delivered"
+EVENTS_FAILED = EVENTS_DIR / "failed"
+
 # One writer at a time is plenty for a single-user capture tool and avoids
 # torn writes to the JSON files.
 _LOCK = threading.RLock()
@@ -54,6 +66,12 @@ _LOCK = threading.RLock()
 # path traversal in filenames.
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _IDEA_ID_RE = re.compile(r"^idea_[a-z0-9]{6,32}$")
+_EVENT_ID_RE = re.compile(r"^evt_[a-z0-9]{6,32}$")
+# Correlation tokens are human-readable and non-authoritative on their own; a
+# write always requires server-side resolution in addition to the token. The
+# alphabet drops easily-confused characters (0/O, 1/I).
+_TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_TOKEN_RE = re.compile(r"^PF-[A-Z2-9]{4,8}$")
 
 # --------------------------------------------------------------------------- #
 # Defaults (seeded on first run, from the project brief)
@@ -121,6 +139,59 @@ _DEFAULT_TEMPLATES: List[Dict[str, Any]] = [
     },
 ]
 
+# v1.1 context review. Defaults OFF: no events are enqueued and no follow-ups
+# are attempted until an operator explicitly enables the feature and configures
+# a reviewer route. Preflight is fully functional without any of this.
+_DEFAULT_CONTEXT_REVIEW: Dict[str, Any] = {
+    "enabled": False,
+    "grace_period_seconds": 600,
+    "max_delivery_attempts": 5,
+    "followup_delivery": "none",  # none | preflight | telegram | api
+    "digest_window_seconds": 900,
+    "event_retention_days": 30,
+}
+
+# Allowed enumerations for the review envelope. Anything outside these collapses
+# to a safe default rather than being persisted verbatim.
+_REVIEW_STATES = {
+    "waiting", "reviewing", "reviewed", "needs_context",
+    "followup_sent", "answered", "failed", "dismissed",
+}
+_SOURCE_KINDS = {"article", "repository", "product", "video", "discussion", "research", "other"}
+_RETRIEVAL_STATUSES = {"not_needed", "ok", "blocked", "failed"}
+_DISPOSITIONS = {
+    "keep_reference", "needs_context", "research_later",
+    "shape_into_plan", "possible_project", "archive_candidate",
+}
+_EFFORT_RISK = {"low", "medium", "high", "unknown"}
+_INTENT_STATUSES = {"present", "missing", "requested", "answered", "dismissed"}
+_ANSWER_VIA = {"preflight", "telegram", "api"}
+
+# The reviewer version stamped onto envelopes this build produces.
+REVIEWER_VERSION = "preflight-context-review/1"
+
+# Optional live webhook transport. Both must be set AND context_review.enabled
+# must be true before any network delivery is attempted. Absent by default so
+# the feature never reaches out on a stock install.
+WEBHOOK_URL = os.environ.get("PREFLIGHT_REVIEW_WEBHOOK_URL", "").strip()
+WEBHOOK_SECRET = os.environ.get("PREFLIGHT_REVIEW_WEBHOOK_SECRET", "").strip()
+
+# Pluggable reviewer. Left None so a stock process performs no review. Tests and
+# adapters install a callable that maps an idea dict to a review-result dict.
+# It is never given filesystem, shell, or credential access.
+_REVIEWER: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+
+
+def set_reviewer(fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]) -> None:
+    """Install (or clear) the review adapter used to process events.
+
+    A reviewer receives a read-only copy of the event-bound idea and returns a
+    partial review-result dict (source/classification/intent). It must not touch
+    the filesystem or issue side effects beyond returning data.
+    """
+    global _REVIEWER
+    _REVIEWER = fn
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -168,6 +239,8 @@ def _ensure_layout() -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     IDEAS_DIR.mkdir(parents=True, exist_ok=True)
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (EVENTS_PENDING, EVENTS_DELIVERED, EVENTS_FAILED):
+        d.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         _atomic_write(
             CONFIG_FILE,
@@ -176,6 +249,7 @@ def _ensure_layout() -> None:
                 "statuses": _clone(_DEFAULT_STATUSES),
                 "templates": _clone(_DEFAULT_TEMPLATES),
                 "source_types": _clone(_DEFAULT_SOURCE_TYPES),
+                "context_review": _clone(_DEFAULT_CONTEXT_REVIEW),
             },
         )
 
@@ -196,7 +270,19 @@ def _load_config() -> Dict[str, Any]:
         cfg["templates"] = _clone(_DEFAULT_TEMPLATES)
     if "source_types" not in cfg:
         cfg["source_types"] = _clone(_DEFAULT_SOURCE_TYPES)
+    # Lazily seed context_review, filling any missing keys with defaults so old
+    # installs and partial configs always expose the full setting surface.
+    cr = cfg.get("context_review")
+    if not isinstance(cr, dict):
+        cr = {}
+    merged = _clone(_DEFAULT_CONTEXT_REVIEW)
+    merged.update({k: v for k, v in cr.items() if k in _DEFAULT_CONTEXT_REVIEW})
+    cfg["context_review"] = merged
     return cfg
+
+
+def _review_config() -> Dict[str, Any]:
+    return _load_config()["context_review"]
 
 
 def _save_config(cfg: Dict[str, Any]) -> None:
@@ -256,11 +342,14 @@ def _idea_for_output(idea: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(idea)
     out["source_url"] = _clean_url(out.get("source_url"))
     out["promoted_to_kanban"] = _clean_promoted_to_kanban(out.get("promoted_to_kanban"))
+    if "review" in out:
+        out["review"] = _sanitize_review(out.get("review"))
     return out
 
 
 def _idea_summary(idea: Dict[str, Any]) -> Dict[str, Any]:
     """Trim heavy fields for list responses."""
+    review = idea.get("review")
     return {
         "id": idea.get("id"),
         "title": idea.get("title", ""),
@@ -278,6 +367,9 @@ def _idea_summary(idea: Dict[str, Any]) -> Dict[str, Any]:
         "promoted_to_kanban": _clean_promoted_to_kanban(idea.get("promoted_to_kanban")),
         "archived": bool(idea.get("archived", False)),
         "archived_at": idea.get("archived_at"),
+        # Enough for a review-state badge on the list without shipping the whole
+        # envelope. None when the idea has never been reviewed.
+        "review_state": review.get("state") if isinstance(review, dict) else None,
     }
 
 
@@ -332,7 +424,473 @@ def _normalize_idea(raw: Dict[str, Any]) -> Dict[str, Any]:
         "promoted_to_kanban": _clean_promoted_to_kanban(raw.get("promoted_to_kanban")),
         "archived": archived,
         "archived_at": str(raw["archived_at"]) if archived and raw.get("archived_at") else None,
+        # v1.1: carry an existing review envelope through import/export untouched
+        # (sanitized), or None. Never fabricated for imported ideas.
+        "review": _sanitize_review(raw.get("review")),
     }
+
+
+# --------------------------------------------------------------------------- #
+# v1.1 context review — revisions, envelope, outbox, correlation, retrieval
+# --------------------------------------------------------------------------- #
+
+# Operator-authored fields that define what a reviewer actually reviews. The
+# input revision hashes exactly these, so appending a review, a timeline note,
+# or bumping updated_at does NOT invalidate an in-flight event — but any operator
+# edit does, which is what makes a stale event detectable.
+_REVISION_FIELDS = (
+    "title", "summary", "notes_markdown",
+    "source_url", "source_type", "category", "subcategory", "tags",
+)
+
+
+def _input_revision(idea: Dict[str, Any]) -> str:
+    """Deterministic content hash of the operator-authored idea fields."""
+    payload = {}
+    for k in _REVISION_FIELDS:
+        v = idea.get(k)
+        if k == "tags":
+            v = sorted(str(t) for t in (v or []))
+        payload[k] = v
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _one_of(value: Any, allowed: set, default: Optional[str]) -> Optional[str]:
+    return value if isinstance(value, str) and value in allowed else default
+
+
+def _sanitize_review(raw: Any) -> Optional[Dict[str, Any]]:
+    """Coerce an arbitrary review dict into the bounded envelope shape.
+
+    Drops anything not part of the contract so imported data can never smuggle
+    page bodies, secrets, cookies, or tool logs into a persisted idea. Returns
+    None when there is no review to keep.
+    """
+    if not isinstance(raw, dict):
+        return None
+    src = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+    cls = raw.get("classification") if isinstance(raw.get("classification"), dict) else {}
+    intent = raw.get("intent") if isinstance(raw.get("intent"), dict) else {}
+
+    def _s(v: Any, limit: int) -> str:
+        return str(v or "").strip()[:limit]
+
+    related = [
+        r for r in (cls.get("related_idea_ids") or [])
+        if isinstance(r, str) and _IDEA_ID_RE.match(r)
+    ][:50]
+
+    token = intent.get("correlation_token")
+    token = token if isinstance(token, str) and _TOKEN_RE.match(token) else None
+
+    return {
+        "state": _one_of(raw.get("state"), _REVIEW_STATES, "waiting"),
+        "input_revision": _s(raw.get("input_revision"), 100) or None,
+        "reviewer_version": _s(raw.get("reviewer_version"), 120) or None,
+        "source": {
+            "retrieval_status": _one_of(src.get("retrieval_status"), _RETRIEVAL_STATUSES, "not_needed"),
+            "title": _s(src.get("title"), 300),
+            "kind": _one_of(src.get("kind"), _SOURCE_KINDS, "other"),
+            "summary": _s(src.get("summary"), 4000),
+        },
+        "classification": {
+            "suggested_lane": _s(cls.get("suggested_lane"), 120),
+            "suggested_category": _s(cls.get("suggested_category"), 120),
+            "suggested_subcategory": _s(cls.get("suggested_subcategory"), 120),
+            "related_idea_ids": related,
+            "potential_value": _s(cls.get("potential_value"), 2000),
+            "effort": _one_of(cls.get("effort"), _EFFORT_RISK, "unknown"),
+            "risk": _one_of(cls.get("risk"), _EFFORT_RISK, "unknown"),
+            "recommended_disposition": _one_of(
+                cls.get("recommended_disposition"), _DISPOSITIONS, None
+            ),
+        },
+        "intent": {
+            "status": _one_of(intent.get("status"), _INTENT_STATUSES, "missing"),
+            "question": _s(intent.get("question"), 1000),
+            "correlation_token": token,
+            "revision_bound": _s(intent.get("revision_bound"), 100) or None,
+            "answer": _s(intent.get("answer"), 4000),
+            "answered_at": _s(intent.get("answered_at"), 40) or None,
+            "answered_via": _one_of(intent.get("answered_via"), _ANSWER_VIA, None),
+        },
+        "created_at": _s(raw.get("created_at"), 40) or None,
+        "updated_at": _s(raw.get("updated_at"), 40) or None,
+        "error_code": _s(raw.get("error_code"), 120) or None,
+    }
+
+
+def _blank_review(input_revision: str) -> Dict[str, Any]:
+    now = _now()
+    return _sanitize_review({
+        "state": "waiting",
+        "input_revision": input_revision,
+        "reviewer_version": REVIEWER_VERSION,
+        "intent": {"status": "missing"},
+        "created_at": now,
+        "updated_at": now,
+    })
+
+
+# ---- correlation tokens ---------------------------------------------------- #
+
+
+def _gen_correlation_token(taken: set) -> str:
+    """A short, human-readable token unique within the retained set."""
+    for _ in range(64):
+        # uuid4 gives us entropy without Math.random/Date; fold it into the
+        # non-ambiguous alphabet.
+        n = uuid.uuid4().int
+        chars = []
+        for _ in range(4):
+            n, rem = divmod(n, len(_TOKEN_ALPHABET))
+            chars.append(_TOKEN_ALPHABET[rem])
+        token = "PF-" + "".join(chars)
+        if token not in taken:
+            return token
+    # Extremely unlikely; widen the token rather than collide.
+    return "PF-" + uuid.uuid4().hex[:8].upper()
+
+
+def _pending_tokens() -> Dict[str, str]:
+    """Map correlation_token -> idea_id for every idea awaiting an answer."""
+    out: Dict[str, str] = {}
+    for path in IDEAS_DIR.glob("idea_*.json"):
+        data = _read_json(path, None)
+        if not isinstance(data, dict):
+            continue
+        review = data.get("review")
+        if not isinstance(review, dict):
+            continue
+        intent = review.get("intent") or {}
+        tok = intent.get("correlation_token")
+        if tok and intent.get("status") in ("requested", "missing"):
+            out[tok] = data.get("id")
+    return out
+
+
+# ---- SSRF-safe public source retrieval guard ------------------------------- #
+
+
+def _ip_is_blocked(ip: str) -> bool:
+    """True if an IP is loopback, private, link-local, reserved, or metadata."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    # The cloud metadata service and its IPv6 form are always refused.
+    if str(addr) in ("169.254.169.254", "fd00:ec2::254"):
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+        or getattr(addr, "is_site_local", False)
+    )
+
+
+def validate_public_url(url: str, *, resolve: bool = True) -> Tuple[bool, str]:
+    """Vet a URL for public source retrieval. Returns (ok, reason).
+
+    Enforced before every request AND every redirect hop by a caller. Rejects
+    non-http(s) schemes and any destination that resolves to a loopback,
+    private, link-local, reserved, or metadata address. When ``resolve`` is
+    False the DNS step is skipped (literal-IP checks still apply) — used by
+    tests to stay offline.
+    """
+    raw = (url or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return False, "empty or malformed url"
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False, "scheme must be http or https"
+    host = parsed.hostname
+    if not host:
+        return False, "missing host"
+
+    # Literal IP in the URL: check it directly, no DNS.
+    try:
+        ipaddress.ip_address(host)
+        return (False, "blocked ip") if _ip_is_blocked(host) else (True, "ok")
+    except ValueError:
+        pass
+
+    if not resolve:
+        return True, "ok (unresolved)"
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror:
+        return False, "dns resolution failed"
+    for info in infos:
+        ip = info[4][0]
+        if _ip_is_blocked(ip):
+            return False, f"resolves to blocked address {ip}"
+    return True, "ok"
+
+
+# ---- HMAC webhook signing -------------------------------------------------- #
+
+
+def sign_payload(secret: str, body: bytes) -> str:
+    """Detached HMAC-SHA256 signature for webhook transport authentication."""
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return "sha256=" + digest
+
+
+def verify_signature(secret: str, body: bytes, signature: str) -> bool:
+    return hmac.compare_digest(sign_payload(secret, body), signature or "")
+
+
+# ---- durable outbox -------------------------------------------------------- #
+
+
+def _event_path(dirpath: Path, event_id: str) -> Path:
+    if not _EVENT_ID_RE.match(event_id):
+        raise HTTPException(status_code=400, detail="invalid event id")
+    return _safe_path(dirpath, f"{event_id}.json")
+
+
+def _iter_events(dirpath: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not dirpath.exists():
+        return out
+    for path in dirpath.glob("evt_*.json"):
+        data = _read_json(path, None)
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def _find_event_by_idempotency(key: str) -> Optional[Dict[str, Any]]:
+    """An event with this idempotency key that is pending or already delivered.
+
+    Failed events are ignored so a caller can legitimately retry after failure,
+    but a live/succeeded event blocks duplicate enqueues and duplicate reviews.
+    """
+    for d in (EVENTS_PENDING, EVENTS_DELIVERED):
+        for ev in _iter_events(d):
+            if ev.get("idempotency_key") == key:
+                return ev
+    return None
+
+
+def _enqueue_event(idea: Dict[str, Any], event_type: str = "idea.created") -> Optional[Dict[str, Any]]:
+    """Write a review event to the outbox. Idempotent per (type, id, revision).
+
+    Returns the event (existing or newly written), or None when context review
+    is disabled. Callers treat a None/raise here as non-fatal: capture must
+    still succeed.
+    """
+    if not _review_config().get("enabled"):
+        return None
+    rev = _input_revision(idea)
+    idem = f"{event_type}:{idea['id']}:{rev}"
+    existing = _find_event_by_idempotency(idem)
+    if existing is not None:
+        return existing
+    event = {
+        "schema_version": 1,
+        "event_id": "evt_" + uuid.uuid4().hex[:16],
+        "event_type": event_type,
+        "idea_id": idea["id"],
+        "idea_revision": rev,
+        "idempotency_key": idem,
+        "created_at": _now(),
+        "attempts": 0,
+        "last_attempt_at": None,
+        "last_error": None,
+        "status": "pending",
+    }
+    _atomic_write(_event_path(EVENTS_PENDING, event["event_id"]), event)
+    return event
+
+
+def _move_event(event: Dict[str, Any], dest: Path) -> None:
+    src = _event_path(EVENTS_PENDING, event["event_id"])
+    _atomic_write(_event_path(dest, event["event_id"]), event)
+    if dest != EVENTS_PENDING and src.exists():
+        src.unlink()
+
+
+def _public_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Diagnostics view of an event — no secret material is ever stored here,
+    but be explicit about the exposed shape."""
+    return {
+        "event_id": ev.get("event_id"),
+        "event_type": ev.get("event_type"),
+        "idea_id": ev.get("idea_id"),
+        "idea_revision": ev.get("idea_revision"),
+        "status": ev.get("status"),
+        "attempts": ev.get("attempts", 0),
+        "created_at": ev.get("created_at"),
+        "last_attempt_at": ev.get("last_attempt_at"),
+        "last_error": ev.get("last_error"),
+    }
+
+
+def _apply_review(idea_id: str, review: Dict[str, Any], timeline_note: Optional[str] = None) -> Dict[str, Any]:
+    """Write a review envelope onto an idea WITHOUT touching operator fields.
+
+    Reloads under lock, replaces only ``review`` (and appends an optional
+    timeline note), and refuses to clobber a review bound to a newer revision.
+    """
+    with _LOCK:
+        idea = _load_idea(idea_id)
+        current = idea.get("review") if isinstance(idea.get("review"), dict) else None
+        # Fail closed against stale writes: never let an older input revision
+        # overwrite a review already recorded for newer idea bytes.
+        if current and current.get("input_revision") and review.get("input_revision"):
+            if current["input_revision"] != review["input_revision"]:
+                live_rev = _input_revision(idea)
+                if review["input_revision"] != live_rev:
+                    raise HTTPException(status_code=409, detail="stale review revision")
+        review = _sanitize_review(review)
+        review["updated_at"] = _now()
+        idea["review"] = review
+        idea["updated_at"] = review["updated_at"]
+        if timeline_note:
+            idea.setdefault("updates", []).append(
+                {"at": review["updated_at"], "by": "reviewer", "body": timeline_note[:10000]}
+            )
+        _atomic_write(_idea_path(idea_id), idea)
+    return idea
+
+
+def process_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the installed reviewer for one event and persist the result.
+
+    Idempotent and revision-guarded. Never mutates operator-authored fields.
+    Retrieval/model failure yields a bounded ``failed`` review state, not a lost
+    idea. Returns the (possibly updated) event.
+    """
+    cfg = _review_config()
+    max_attempts = int(cfg.get("max_delivery_attempts", 5) or 5)
+    event = dict(event)
+    event["attempts"] = int(event.get("attempts", 0)) + 1
+    event["last_attempt_at"] = _now()
+
+    idea = _read_json(_idea_path(event["idea_id"]), None)
+    if not isinstance(idea, dict):
+        event["status"] = "failed"
+        event["last_error"] = "idea not found"
+        with _LOCK:
+            _move_event(event, EVENTS_FAILED)
+        return event
+
+    # Stale guard: the idea moved on since the event was enqueued.
+    if _input_revision(idea) != event.get("idea_revision"):
+        event["status"] = "failed"
+        event["last_error"] = "stale event (idea revised)"
+        with _LOCK:
+            _move_event(event, EVENTS_FAILED)
+        return event
+
+    if _REVIEWER is None:
+        # Nothing to deliver to yet; leave the event pending for a future drain.
+        event["status"] = "pending"
+        event["last_error"] = "no reviewer configured"
+        with _LOCK:
+            _move_event(event, EVENTS_PENDING)
+        return event
+
+    try:
+        result = _REVIEWER(_idea_for_output(idea)) or {}
+    except Exception as exc:  # noqa: BLE001 — bound any adapter failure
+        review = _blank_review(event["idea_revision"])
+        review["state"] = "failed"
+        review["error_code"] = "reviewer_error"
+        _apply_review(event["idea_id"], review, "Review failed; idea preserved.")
+        if event["attempts"] >= max_attempts:
+            event["status"] = "failed"
+            event["last_error"] = f"reviewer error: {type(exc).__name__}"
+            with _LOCK:
+                _move_event(event, EVENTS_FAILED)
+        else:
+            event["status"] = "pending"
+            event["last_error"] = f"reviewer error: {type(exc).__name__}"
+            with _LOCK:
+                _move_event(event, EVENTS_PENDING)
+        return event
+
+    review = _build_review_from_result(idea, event["idea_revision"], result)
+    _apply_review(event["idea_id"], review, "Context review completed.")
+    event["status"] = "delivered"
+    event["last_error"] = None
+    with _LOCK:
+        _move_event(event, EVENTS_DELIVERED)
+    return event
+
+
+def _build_review_from_result(idea: Dict[str, Any], revision: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold a reviewer result into a full envelope, deciding intent + state.
+
+    Source facts, agent suggestions, and operator intent are kept in separate
+    sub-objects. A suggested classification is NEVER treated as operator intent.
+    """
+    review = _blank_review(revision)
+    review["source"] = _sanitize_review({"source": result.get("source", {})})["source"]
+    review["classification"] = _sanitize_review(
+        {"classification": result.get("classification", {})}
+    )["classification"]
+
+    intent = result.get("intent") if isinstance(result.get("intent"), dict) else {}
+    has_intent = bool(intent.get("present"))
+    if has_intent:
+        review["intent"]["status"] = "present"
+        review["state"] = "reviewed"
+    else:
+        # Ask exactly one concise follow-up, correlated by token bound to this
+        # revision. The follow-up is only "sent" if delivery is configured;
+        # otherwise it waits as needs_context.
+        with _LOCK:
+            token = _gen_correlation_token(set(_pending_tokens().keys()))
+        review["intent"]["status"] = "requested"
+        review["intent"]["question"] = str(
+            intent.get("question")
+            or "What caught your attention: using it directly, borrowing a design "
+            "pattern, researching it later, or keeping it as a reference?"
+        )[:1000]
+        review["intent"]["correlation_token"] = token
+        review["intent"]["revision_bound"] = revision
+        review["state"] = "needs_context"
+    return review
+
+
+def drain_pending(limit: int = 100) -> List[Dict[str, Any]]:
+    """Process up to ``limit`` pending events. Returns the processed events.
+
+    Safe to call repeatedly; each call is idempotent per event because a
+    delivered event is moved out of ``pending``.
+    """
+    processed: List[Dict[str, Any]] = []
+    with _LOCK:
+        pending = _iter_events(EVENTS_PENDING)[:limit]
+    for ev in pending:
+        processed.append(process_event(ev))
+    return processed
+
+
+def _prune_events() -> None:
+    """Drop delivered/failed events older than the configured retention."""
+    days = int(_review_config().get("event_retention_days", 30) or 30)
+    if days <= 0:
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    for d in (EVENTS_DELIVERED, EVENTS_FAILED):
+        for path in d.glob("evt_*.json"):
+            ev = _read_json(path, None)
+            if isinstance(ev, dict):
+                stamp = ev.get("last_attempt_at") or ev.get("created_at") or ""
+                if stamp and stamp < cutoff:
+                    path.unlink()
 
 
 # --------------------------------------------------------------------------- #
@@ -418,6 +976,21 @@ class ImportIn(BaseModel):
     ideas: Optional[List[Dict[str, Any]]] = None
 
 
+class IntentAnswerIn(BaseModel):
+    token: str = Field(min_length=1, max_length=32)
+    answer: str = Field(min_length=1, max_length=4000)
+    answered_via: str = "preflight"
+
+
+class ContextReviewPatch(BaseModel):
+    enabled: Optional[bool] = None
+    grace_period_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
+    max_delivery_attempts: Optional[int] = Field(default=None, ge=1, le=100)
+    followup_delivery: Optional[str] = None
+    digest_window_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
+    event_retention_days: Optional[int] = Field(default=None, ge=0, le=3650)
+
+
 # --------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------- #
@@ -446,6 +1019,7 @@ async def get_config() -> Dict[str, Any]:
         "priorities": _PRIORITIES,
         # Prepend the always-available "unset" option; the rest are editable.
         "source_types": [{"id": "", "label": "—", "emoji": ""}] + cfg.get("source_types", []),
+        "context_review": cfg.get("context_review", _clone(_DEFAULT_CONTEXT_REVIEW)),
     }
 
 
@@ -706,10 +1280,20 @@ async def create_idea(body: IdeaIn) -> Dict[str, Any]:
         "promoted_to_kanban": None,
         "archived": False,
         "archived_at": None,
+        "review": None,
     }
     with _LOCK:
         _ensure_layout()
         _atomic_write(_idea_path(idea["id"]), idea)
+        # Idea persistence is authoritative and has already completed. Enqueue is
+        # best-effort: a failure here must never fail capture.
+        try:
+            event = _enqueue_event(idea, "idea.created")
+            if event is not None:
+                idea["review"] = _blank_review(event["idea_revision"])
+                _atomic_write(_idea_path(idea["id"]), idea)
+        except Exception:  # noqa: BLE001 — capture already succeeded
+            pass
     return _idea_for_output(idea)
 
 
@@ -796,6 +1380,169 @@ async def add_update(idea_id: str, body: UpdateIn) -> Dict[str, Any]:
         idea["updated_at"] = entry["at"]
         _atomic_write(_idea_path(idea_id), idea)
     return _idea_for_output(idea)
+
+
+# ---- Context review (v1.1) ------------------------------------------------- #
+#
+# Advisory only. None of these routes mutate operator-authored fields or an
+# idea's status / category / priority / archive / promotion state. Review may
+# enrich an idea; it may never create work.
+
+
+@router.patch("/config/context-review")
+async def update_context_review(body: ContextReviewPatch) -> Dict[str, Any]:
+    """Operator setting for the review feature. Off by default; this is the
+    only way it turns on. It grants no reviewer authority over idea content."""
+    changes = body.model_dump(exclude_unset=True)
+    with _LOCK:
+        _ensure_layout()
+        cfg = _load_config()
+        cr = cfg["context_review"]
+        for key, val in changes.items():
+            if val is None:
+                continue
+            if key == "followup_delivery" and val not in ("none", "preflight", "telegram", "api"):
+                continue
+            cr[key] = val
+        cfg["context_review"] = cr
+        _save_config(cfg)
+    return cr
+
+
+@router.get("/review-events")
+async def list_review_events() -> Dict[str, Any]:
+    """Operator/diagnostics view of the outbox. No secret material."""
+    with _LOCK:
+        _ensure_layout()
+        pending = [_public_event(e) for e in _iter_events(EVENTS_PENDING)]
+        delivered = [_public_event(e) for e in _iter_events(EVENTS_DELIVERED)]
+        failed = [_public_event(e) for e in _iter_events(EVENTS_FAILED)]
+    return {
+        "enabled": bool(_review_config().get("enabled")),
+        "pending": pending,
+        "delivered": delivered,
+        "failed": failed,
+        "counts": {"pending": len(pending), "delivered": len(delivered), "failed": len(failed)},
+    }
+
+
+@router.get("/ideas/{idea_id}/review")
+async def get_review(idea_id: str) -> Dict[str, Any]:
+    """Return the review envelope for an idea (may be null if never reviewed)."""
+    with _LOCK:
+        idea = _load_idea(idea_id)
+    return {"idea_id": idea_id, "review": _sanitize_review(idea.get("review"))}
+
+
+@router.post("/ideas/{idea_id}/review-events")
+async def enqueue_review(idea_id: str) -> Dict[str, Any]:
+    """Enqueue (or re-enqueue) review for the idea's current input revision.
+
+    ``Review again`` binds a fresh event to the current revision. Returns 409
+    when context review is disabled — the feature must be enabled first.
+    """
+    with _LOCK:
+        _ensure_layout()
+        if not _review_config().get("enabled"):
+            raise HTTPException(status_code=409, detail="context review is disabled")
+        idea = _load_idea(idea_id)
+        event = _enqueue_event(idea, "idea.created")
+        # Reset the visible review state to waiting for the current revision,
+        # without disturbing any answer already recorded for that revision.
+        if event is not None:
+            rev = event["idea_revision"]
+            existing = idea.get("review") if isinstance(idea.get("review"), dict) else None
+            if not (existing and existing.get("input_revision") == rev
+                    and (existing.get("intent") or {}).get("status") == "answered"):
+                idea["review"] = _blank_review(rev)
+                idea["updated_at"] = _now()
+                _atomic_write(_idea_path(idea_id), idea)
+    return {"idea_id": idea_id, "event": _public_event(event) if event else None,
+            "review": _sanitize_review(idea.get("review"))}
+
+
+@router.post("/ideas/{idea_id}/intent-answer")
+async def answer_intent(idea_id: str, body: IntentAnswerIn) -> Dict[str, Any]:
+    """Append an operator's intent answer, bound to a valid correlation token.
+
+    Fails closed on expired / used / mismatched / ambiguous tokens. Replaying
+    the same answer is idempotent. A reply to an older revision cannot overwrite
+    a newer intent answer.
+    """
+    token = body.token.strip().upper()
+    if not _TOKEN_RE.match(token):
+        raise HTTPException(status_code=400, detail="malformed correlation token")
+    answered_via = body.answered_via if body.answered_via in _ANSWER_VIA else "preflight"
+
+    with _LOCK:
+        idea = _load_idea(idea_id)
+        review = idea.get("review") if isinstance(idea.get("review"), dict) else None
+        if not review:
+            raise HTTPException(status_code=404, detail="no review to answer")
+        intent = review.get("intent") or {}
+
+        # Server-side resolution: the token must resolve to THIS idea, and this
+        # idea must actually be awaiting an answer for it.
+        resolved = _pending_tokens().get(token)
+        if intent.get("correlation_token") != token:
+            raise HTTPException(status_code=409, detail="token does not match this idea")
+        if resolved != idea_id and intent.get("status") != "answered":
+            raise HTTPException(status_code=409, detail="token not pending for this idea")
+
+        # Idempotent replay: same token + same answer already recorded → no-op.
+        if intent.get("status") == "answered":
+            if (intent.get("answer") or "") == body.answer.strip():
+                return {"idea_id": idea_id, "review": _sanitize_review(review), "idempotent": True}
+            raise HTTPException(status_code=409, detail="intent already answered")
+
+        # A reply must target the revision the token was bound to; if the idea
+        # moved on, fail closed rather than attach intent to stale content.
+        bound = intent.get("revision_bound") or review.get("input_revision")
+        if bound and bound != _input_revision(idea):
+            raise HTTPException(status_code=409, detail="token bound to an older revision")
+
+        now = _now()
+        intent["status"] = "answered"
+        intent["answer"] = body.answer.strip()
+        intent["answered_at"] = now
+        intent["answered_via"] = answered_via
+        review["intent"] = intent
+        review["state"] = "answered"
+        review["updated_at"] = now
+        idea["review"] = _sanitize_review(review)
+        idea["updated_at"] = now
+        # Recorded as operator-provided intent — it never replaces the original
+        # notes, and it is clearly attributed to the operator.
+        idea.setdefault("updates", []).append(
+            {"at": now, "by": "operator", "body": f"Intent captured ({token}): {intent['answer']}"[:10000]}
+        )
+        _atomic_write(_idea_path(idea_id), idea)
+    return {"idea_id": idea_id, "review": _sanitize_review(idea["review"]), "idempotent": False}
+
+
+@router.post("/ideas/{idea_id}/review-dismiss")
+async def dismiss_review(idea_id: str) -> Dict[str, Any]:
+    """Dismiss the current follow-up without changing the idea's disposition."""
+    with _LOCK:
+        idea = _load_idea(idea_id)
+        review = idea.get("review") if isinstance(idea.get("review"), dict) else None
+        if not review:
+            raise HTTPException(status_code=404, detail="no review to dismiss")
+        now = _now()
+        intent = review.get("intent") or {}
+        intent["status"] = "dismissed"
+        # Retire the token so it can never be answered after dismissal.
+        intent["correlation_token"] = None
+        review["intent"] = intent
+        review["state"] = "dismissed"
+        review["updated_at"] = now
+        idea["review"] = _sanitize_review(review)
+        idea["updated_at"] = now
+        idea.setdefault("updates", []).append(
+            {"at": now, "by": "operator", "body": "Review follow-up dismissed"}
+        )
+        _atomic_write(_idea_path(idea_id), idea)
+    return {"idea_id": idea_id, "review": _sanitize_review(idea["review"])}
 
 
 # ---- Promote to Kanban (draft only) --------------------------------------- #

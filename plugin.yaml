@@ -1,5 +1,5 @@
 name: preflight-idea-capture
-version: "1.0.8"
+version: "1.1.0"
 description: Lightweight Hermes Dashboard idea-capture staging area before ideas become Kanban execution items.
 license: MIT
 # Set this after you create the GitHub repo:

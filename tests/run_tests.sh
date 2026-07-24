@@ -50,3 +50,6 @@ fi
 
 echo "== API smoke test =="
 "$PY" "$ROOT/tests/smoke_test.py"
+
+echo "== v1.1 context-review test =="
+"$PY" "$ROOT/tests/review_test.py"
