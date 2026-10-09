@@ -81,7 +81,7 @@ Clone this repository into your Hermes plugins path, or copy the repository
 directory there, then enable it and (re)start the dashboard:
 
 ```bash
-git clone https://github.com/ori8automations/preflight-hermes-idea-capture.git ~/.hermes/plugins/preflight-idea-capture
+git clone https://github.com/Ori8-Automations/preflight-hermes-idea-capture.git ~/.hermes/plugins/preflight-idea-capture
 hermes plugins enable preflight-idea-capture
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open
 ```
@@ -104,7 +104,7 @@ curl http://127.0.0.1:9119/api/dashboard/plugins/rescan
 The **Preflight** tab appears in the dashboard nav.
 
 > Repo layout note: `plugin.yaml` intentionally lives at the repository root so
-> dashboard/CLI installs using plain `ori8automations/preflight-hermes-idea-capture`
+> dashboard/CLI installs using plain `Ori8-Automations/preflight-hermes-idea-capture`
 > can discover the plugin without requiring a subdirectory path.
 
 ## Layout
