@@ -68,6 +68,141 @@ No dummy data: Preflight starts with an empty category tree, a set of sensible
 default statuses, a few generic starter templates, and a generic list of source
 types — all editable.
 
+## v1.1 — Context review and intent capture
+
+v1.1 adds an optional, event-driven review flow for rough ideas and link-only
+captures. It summarizes public source material, suggests a classification, and
+asks the operator one concise follow-up when the reason for saving an item is
+missing — without ever turning a thought into active work.
+
+**This release ships the v1.1 backend.** The feature is **off by default** and
+stays fully inert — no events, no network, no messages — until an operator
+enables it (`PATCH /config/context-review`) *and* configures a route. Preflight
+is completely functional with it disabled, and existing v1.0 data loads
+unchanged.
+
+### Capture and the outbox
+
+- A **durable local outbox**
+  (`<DATA_ROOT>/events/{pending,processing,delivered,failed}`). Idea persistence
+  stays authoritative and completes first; enqueue is best-effort and never
+  blocks or fails capture.
+- **Idempotent, revision-bound events** (key = `event_type + idea_id +
+  input_revision + generation`). Duplicate delivery creates no duplicate reviews
+  or messages, and a **stale event can't overwrite** a review recorded for newer
+  idea bytes.
+- The **input revision covers operator-authored timeline updates**, not just the
+  form fields — a note carrying the missing "why" correctly invalidates an
+  in-flight event instead of letting it review changed content.
+- A **grace period** (default 600s) is enforced before an event becomes due, so
+  a capture the operator is still editing isn't reviewed mid-thought. A drain
+  that runs too early burns no retry budget.
+- **Single-consumer claims**: a claim is published only once it is already
+  complete. The full lease (owner + timestamp) is written to a unique temp file
+  with a **checked write-all loop** and `fsync`'d, then `os.link()`'d onto the
+  `processing/` path — `link()` fails with `EEXIST`, making it a no-clobber
+  atomic publish with exactly one winner. Three things are deliberately *not*
+  done: plain `rename` as the claim (it replaces an existing destination, so it
+  cannot express "claim only if unclaimed"); `O_EXCL`-create-then-write (it
+  publishes an *empty* file first, so a crash between the steps leaves a
+  malformed lease that blocks every future claim); and an unchecked `os.write`
+  (a short write is legal, and ignoring the byte count publishes truncated JSON
+  while reporting success). Zero or stalled write progress fails the claim and
+  leaves the pending copy intact.
+- **Concurrency contract**: Hermes runs **one** dashboard process (a single
+  `uvicorn.Server`, no worker-count override) with each plugin API imported once
+  into it, so *threads inside one process* are the supported contract and the
+  process-wide `RLock` is the serialization boundary. Concurrent drains are
+  covered; multi-process and multi-host writers are explicitly **not** claimed.
+  The claim primitive itself is a filesystem operation, so it stays exclusive
+  even without a lock — but that's a property of the primitive, not a
+  cross-process guarantee for everything else.
+- **Bounded recovery with explicit precedence**: recovery reconciles duplicate
+  states *before* reclaiming anything. A durable **terminal record
+  (`delivered`/`failed`) always wins** over a leftover `processing` lease — that
+  ordering is what stops an interrupted finalization from resurrecting completed
+  work on restart. Then: a live lease is never touched; an expired lease returns
+  to `pending` with its owner invalidated; a malformed artifact is quarantined
+  once provably not in flight. **A failed quarantine move leaves the source
+  exactly where it was and is not counted as a recovery** — "could not preserve"
+  never becomes deletion.
+- **Ownership binds every transition**: the lease is verified before the webhook
+  send, before a failure write or retry, before a grace re-queue, before the
+  missing-idea and stale-revision exits, and again atomically with the review
+  apply and finalization. A displaced owner cannot send, apply, retry, fail, or
+  delete another owner's queue state.
+- **Crash semantics**: dying mid-claim costs a delay, never a double review and
+  never a stranded or deleted event. Writes are `fsync`'d with collision-safe
+  temp names.
+- **Bounded retries** everywhere, including the no-route case, and **retention
+  pruning** actually runs on each drain.
+- **Follow-up notification** is a claim → send → compare-and-swap transition
+  bound to (revision, generation, token), so concurrent senders *within the
+  dashboard process* produce one physical message and an answer or newer
+  generation arriving mid-flight is never overwritten back to `followup_sent`.
+  Delivery is **at-least-once**: each message carries a stable `idempotency_key`
+  so a sink that can deduplicate will collapse a retry after a crash between send
+  and acknowledgement.
+- **Imported tokens fail closed**: a token with missing, malformed, out-of-order,
+  timezone-less, or elapsed issuance/expiry is retired on import, as is one
+  colliding with *any* retained token — including answered history — so an import
+  cannot resurrect a used token as a new answerable one. A missing expiry never
+  means "never expires", and vetting keys off whether a token is *answerable*
+  rather than off one status spelling, so `missing` is validated exactly like
+  `requested`. Malformed import data fails closed instead of raising a 500.
+
+### Review, intent, and notifications
+
+- A **bounded review envelope** stored alongside the idea (never blended into
+  `notes_markdown`). Source facts, agent suggestions, and operator intent stay
+  in separate sub-objects; a suggested classification is never treated as intent.
+- **Correlation-token intent capture**, fail-closed: malformed, used,
+  superseded-revision, **expired**, and **ambiguous** tokens are all refused.
+  Token resolution handles zero/one/many matches explicitly, so two imported
+  ideas sharing a token can never be answered by a guess. Replaying the same
+  answer is idempotent; `not sure anymore` is a valid answer.
+- **`Review again` does real work and is non-destructive**: it bumps a review
+  *generation* so a re-review is a distinct event even for byte-identical
+  content, and the previous completed review stays visible (flagged
+  `review_pending`) until a replacement actually lands.
+- **Notification budget**: nothing is sent when intent is present, at most one
+  unanswered follow-up per idea generation, and captures arriving within
+  `digest_window_seconds` are grouped into a single **digest** instead of N
+  alerts.
+
+### Transport, retrieval, and authority
+
+- **HMAC-SHA256 webhook delivery** to a configured reviewer. The payload carries
+  only ids and the revision — never the idea body or fetched source content.
+  An **empty secret fails closed** (signing raises rather than minting a
+  forgeable signature), and the webhook target is SSRF-validated before any
+  request is made.
+- **Bounded public-source retrieval** (`fetch_public_source`): absolute http(s)
+  only, SSRF re-validation **on every redirect hop** (not just the first),
+  redirect-count / size / declared-content-length / timeout limits, text-only
+  content types (no binary downloads), and redirect-loop detection. Only a
+  bounded summary and retrieval metadata are persisted — never the raw body.
+  Fetched pages are treated as **untrusted data, never instructions**.
+- **Authority limits enforced in code**: a reviewer may only write the review
+  envelope and append a review/intent timeline note. It cannot change the
+  operator-authored title, summary, notes, category, status, priority, tags,
+  archive, or promotion state, and no raw page bodies, cookies, or secrets are
+  persisted.
+- Both network boundaries are **injected seams** (`set_http_transport`), so the
+  full webhook and fetch paths are exercised offline in tests.
+
+Network access is declared in `plugin.yaml` because live delivery and retrieval
+need it; neither is reachable unless the feature is enabled and a route is set.
+
+Still deferred: the **review UI** (badges, source/intent/agent sections,
+`Review again` / `Answer` / `Dismiss` controls). The dashboard bundle
+(`dist/index.js`) is a prebuilt artifact with no source in this repo, so the UI
+awaits the frontend source. All review state is exposed via the API below.
+
+See the [v1.1 context review and intent capture specification](docs/v1.1-context-review-and-intent-capture.md)
+for the full event model, security boundary, notification budget, and
+acceptance criteria.
+
 ## Requirements
 
 - A running Hermes Agent dashboard (FastAPI backend).
@@ -128,10 +263,30 @@ File-backed JSON, all under a single allow-listed data root:
 ```
 <DATA_ROOT>/
   categories.json         # category tree + custom status/source/template definitions
+                          #   + context_review settings
   ideas/
     idea_<id>.json        # one file per idea
   attachments/            # reserved for future use
+  events/                 # v1.1 review outbox (created lazily)
+    pending/              #   enqueued, awaiting its grace period / a reviewer
+    processing/           #   claimed by a worker (lease; reclaimed if abandoned)
+    delivered/            #   reviewed or handed off successfully
+    failed/               #   stale or exhausted retries
+    quarantine/           #   unusable artifacts kept for inspection, never deleted
 ```
+
+Recovery precedence, if a crash leaves an event in two places at once: a durable
+`delivered`/`failed` record always wins over a leftover `processing` lease, so
+completed work is never resurrected and re-reviewed.
+
+There is no background thread: the outbox is driven explicitly by
+`POST /review-events/drain` (and follow-ups by
+`POST /review-events/send-followups`), so nothing happens on a schedule you
+didn't configure. Durability guarantee: each event and idea file is written to a
+uniquely-named temp file, `fsync`'d, then atomically renamed, with a best-effort
+directory `fsync` — so a completed write survives a crash. In-process locking is
+process-local; cross-process safety comes from the atomic-rename claim, not the
+lock.
 
 Default `DATA_ROOT` is `$HERMES_HOME/idea-capture` (falling back to
 `~/.hermes/idea-capture`). Override it with the `PREFLIGHT_IDEA_CAPTURE_DIR`
@@ -154,6 +309,15 @@ with **Import** (merge or replace).
   `http://` or `https://` URLs. Unsafe schemes are blanked on create, update,
   import, export, and Kanban draft output.
 - **No secrets/logs access, no external dependencies.**
+- **Network is opt-in and inert by default:** the only outbound paths belong to
+  v1.1 context review (webhook delivery, public-source retrieval). Both require
+  the feature to be enabled *and* a route configured. Every destination —
+  including each redirect hop — is re-validated against loopback, private,
+  link-local, reserved, IPv4-mapped, and cloud-metadata ranges before a request
+  is made. Webhook delivery refuses to sign with an empty secret.
+- **Review cannot create work:** a reviewer may only write the review envelope
+  and append a timeline note. It can never change operator-authored fields or an
+  idea's status, archive, or promotion state.
 
 ## Idea record shape
 
@@ -175,9 +339,15 @@ with **Import** (merge or replace).
   "updated_at": "…",
   "promoted_to_kanban": null,
   "archived": false,
-  "archived_at": null
+  "archived_at": null,
+  "review": null
 }
 ```
+
+`review` is `null` until v1.1 context review runs for the idea. When present it
+is a bounded envelope with `state`, `input_revision`, `reviewer_version`, and
+separate `source` / `classification` / `intent` sub-objects — see the
+[v1.1 spec](docs/v1.1-context-review-and-intent-capture.md#record-model).
 
 ## API (mounted at `/api/plugins/preflight-idea-capture`)
 
@@ -198,6 +368,14 @@ with **Import** (merge or replace).
 | POST | `/ideas/{id}/promote-draft` | Generate a Kanban card draft (draft only) |
 | GET | `/export` | Export the full dataset (config + all ideas) as JSON |
 | POST | `/import` | Import a dataset (`mode`: `merge` or `replace`) |
+| PATCH | `/config/context-review` | Toggle/configure v1.1 review (off by default) |
+| GET | `/review-events` | Outbox diagnostics (pending/processing/delivered/failed; no secrets) |
+| POST | `/review-events/drain` | Process due events now (grace-gated, lease-claimed) |
+| POST | `/review-events/send-followups` | Deliver due follow-ups, batching into a digest |
+| POST | `/ideas/{id}/review-events` | Enqueue/re-enqueue review (bumps generation) |
+| GET | `/ideas/{id}/review` | Return the review envelope (may be `null`) |
+| POST | `/ideas/{id}/intent-answer` | Append operator intent, bound to a correlation token |
+| POST | `/ideas/{id}/review-dismiss` | Dismiss the follow-up without changing disposition |
 
 ### Export / import format
 
@@ -252,14 +430,21 @@ A self-contained smoke test exercises static checks plus the full API surface
 (health, config, category/subcategory/template/idea CRUD, source-type filter,
 updates, export/import round-trip, custom source-type restore into a fresh data
 root, source URL scheme safety, mobile stylesheet checks, promote-draft with `{}` **and** with no body,
-bad-id rejection, and path-traversal safety):
+bad-id rejection, and path-traversal safety). A second suite
+(`tests/review_test.py`) covers the v1.1 acceptance matrix — capture durability,
+outbox grace timing / leases / bounded retry / retention, concurrent drains,
+review correctness, intent-token correlation including ambiguity and expiry,
+notification budgeting and digest batching, HMAC webhook transport, bounded
+source retrieval with redirect-hop SSRF checks and size/type limits, authority
+limits, and v1.0 compatibility. Both HTTP boundaries are injected seams, so the
+whole path runs offline:
 
 ```bash
 ./tests/run_tests.sh
 ```
 
-It runs `py_compile`, `node --check`, and a FastAPI `TestClient` suite against a
-temporary `PREFLIGHT_IDEA_CAPTURE_DIR`.
+It runs `py_compile`, `node --check`, and two FastAPI `TestClient` suites against
+temporary `PREFLIGHT_IDEA_CAPTURE_DIR`s.
 
 The runner auto-selects a Python that has the test deps: it prefers `$PYTHON`,
 then an active `$VIRTUAL_ENV`, then `/opt/hermes/.venv/bin/python`, then

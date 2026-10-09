@@ -1,5 +1,5 @@
 name: preflight-idea-capture
-version: "1.0.8"
+version: "1.1.0"
 description: Lightweight Hermes Dashboard idea-capture staging area before ideas become Kanban execution items.
 license: MIT
 # Set this after you create the GitHub repo:
@@ -9,11 +9,14 @@ license: MIT
 entry_points:
   dashboard: dashboard/manifest.json
 
-# Preflight ships no agent tools, makes no network calls, and only ever
-# reads/writes inside its own data root.
+# Preflight ships no agent tools and only ever reads/writes inside its own data
+# root. Network access is required only by the optional v1.1 context-review
+# feature (outbound webhook delivery to a configured reviewer, and bounded
+# public-source retrieval). Both stay completely inert until an operator enables
+# context_review AND configures a route; nothing here reaches out by default.
 permissions:
   tools: false
-  network: false
+  network: true
   filesystem:
     - ${HERMES_HOME}/idea-capture
     - ${PREFLIGHT_IDEA_CAPTURE_DIR}
